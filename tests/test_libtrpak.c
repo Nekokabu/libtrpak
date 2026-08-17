@@ -1,26 +1,67 @@
+/**
+ * @file test_libtrpak.c
+ * @brief Host test suite for libtrpak, run with `make test`.
+ *
+ * The library is compiled with `TRPAK_NO_DEFAULT_IO`, so no libdragon backend
+ * exists and every accessory access must go through the mock installed with
+ * trpak_configure_io(). That mock (::mock_transfer_pak) emulates enough of the
+ * Transfer Pak to exercise the real code paths on a PC:
+ *
+ * - a power register whose read-back mirrors what was written;
+ * - a status byte synthesized from power, access mode, and a removal flag;
+ * - the bank register at `0xA000`, kept in mock_transfer_pak::window;
+ * - a 32 KiB ROM image and an 8 KiB RAM image behind the data window;
+ * - a block of memory standing in for flashcart SDRAM, for the DMA callbacks.
+ *
+ * The mock only implements the slices the library actually uses, notably
+ * slice 2 for RAM; MBC register writes land in the catch-all branch of
+ * mock_write() and are accepted without side effects, which is enough because
+ * the test cartridge is a plain `ROM + RAM` type with no banking.
+ *
+ * Failures abort through `assert()`, so the suite is meant to be built without
+ * `NDEBUG`. Exiting with status `0` and printing the final line means every
+ * assertion held.
+ */
+
 #include "../libtrpak.h"
 
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
 
+/** Simulated cartridge ROM: two 16 KiB banks. */
 #define MOCK_ROM_SIZE (2u * TRPAK_ROM_BANK_SIZE)
+/** Simulated cartridge save RAM: one 8 KiB bank. */
 #define MOCK_RAM_SIZE TRPAK_RAM_BANK_SIZE
+/** Base address the DMA callbacks translate into ::mock_transfer_pak::dma. */
 #define MOCK_DMA_BASE ((uintptr_t)0x10000000u)
 
+/**
+ * @brief State of the simulated Transfer Pak and cartridge.
+ */
 typedef struct mock_transfer_pak {
-    uint8_t rom[MOCK_ROM_SIZE];
-    uint8_t ram[MOCK_RAM_SIZE];
-    uint8_t dma[MOCK_ROM_SIZE];
-    uint8_t power;
-    uint8_t access;
-    uint8_t window;
-    bool removed;
-    unsigned int delay_calls;
+    uint8_t rom[MOCK_ROM_SIZE]; /**< Cartridge ROM image. */
+    uint8_t ram[MOCK_RAM_SIZE]; /**< Cartridge save RAM image. */
+    uint8_t dma[MOCK_ROM_SIZE]; /**< Stand-in for flashcart SDRAM. */
+    uint8_t power;              /**< Last value written to `0x8000`. */
+    uint8_t access;             /**< Last value written to `0xB000`. */
+    uint8_t window;             /**< Current slice from the `0xA000` register. */
+    bool removed;               /**< Simulates yanking the cartridge out. */
+    unsigned int delay_calls;   /**< Counts delay callback invocations. */
 } mock_transfer_pak;
 
+/** Single mock instance, passed to the callbacks as the user pointer. */
 static mock_transfer_pak mock;
 
+/**
+ * @brief Builds the status byte the library reads from `0xB000`.
+ *
+ * Mirrors the real accessory closely enough for check_cartridge_ready():
+ * removal masks readiness, and readiness requires both power and access mode.
+ *
+ * @param state Mock state to describe.
+ * @return A combination of `TRPAK_STATUS_*` bits.
+ */
 static uint8_t mock_status(const mock_transfer_pak *state)
 {
     uint8_t status = state->power == 0x84u ? TRPAK_STATUS_POWERED : 0u;
@@ -33,6 +74,14 @@ static uint8_t mock_status(const mock_transfer_pak *state)
     return status;
 }
 
+/**
+ * @brief Mock implementation of ::trpak_read_block_fn.
+ *
+ * Decodes the control registers first, then the data window. The ROM branch
+ * applies the same slice arithmetic as real hardware and returns a failure
+ * when a read would fall outside the simulated cartridge, which is what makes
+ * an out-of-range bank selection observable in the tests.
+ */
 static int mock_read(
     void *user,
     int controller,
@@ -54,6 +103,7 @@ static int mock_read(
         data[0] = mock_status(state);
         return 0;
     }
+    /* Slice 2 maps cartridge RAM at 0xE000-0xFFFF. */
     if (state->window == 0x02u && address >= 0xE000u) {
         offset = (size_t)(address - 0xE000u);
         memcpy(data, state->ram + offset, TRPAK_TRANSFER_BLOCK_SIZE);
@@ -71,6 +121,13 @@ static int mock_read(
     return -1;
 }
 
+/**
+ * @brief Mock implementation of ::trpak_write_block_fn.
+ *
+ * Only the first byte of the block matters, matching how write_filled() pokes
+ * single-byte registers. Writes that are neither a control register nor the
+ * RAM window — that is, MBC register writes — are accepted and ignored.
+ */
 static int mock_write(
     void *user,
     int controller,
@@ -83,6 +140,7 @@ static int mock_write(
 
     assert(controller == 0);
     if (address == 0x8000u) {
+        /* Real hardware only recognizes 0x84 as "on"; anything else is off. */
         state->power = data[0] == 0x84u ? 0x84u : 0u;
         return 0;
     }
@@ -102,6 +160,13 @@ static int mock_write(
     return 0;
 }
 
+/**
+ * @brief Mock implementation of ::trpak_delay_fn; counts calls instead of
+ *        sleeping.
+ *
+ * The assertion documents an invariant of the library: it never asks for a
+ * zero-length delay.
+ */
 static void mock_delay(void *user, unsigned int milliseconds)
 {
     mock_transfer_pak *state = user;
@@ -109,6 +174,13 @@ static void mock_delay(void *user, unsigned int milliseconds)
     state->delay_calls++;
 }
 
+/**
+ * @brief Mock implementation of ::trpak_dma_store_fn.
+ *
+ * Validates that the library always presents an absolute address at or above
+ * the configured base, and that the running offset stays inside the simulated
+ * SDRAM.
+ */
 static int mock_dma_store(
     void *user,
     const uint8_t *source,
@@ -130,6 +202,10 @@ static int mock_dma_store(
     return 0;
 }
 
+/**
+ * @brief Mock implementation of ::trpak_dma_load_fn, the restore counterpart
+ *        of mock_dma_store().
+ */
 static int mock_dma_load(
     void *user,
     uint8_t *destination,
@@ -151,6 +227,15 @@ static int mock_dma_load(
     return 0;
 }
 
+/**
+ * @brief Writes the Game Boy header checksum into a synthetic header.
+ *
+ * Intentionally an independent reimplementation of the algorithm in
+ * trpak_check_header_checksum(), so a change to either side shows up as a test
+ * failure instead of being silently mirrored.
+ *
+ * @param header Buffer for Game Boy addresses `0x0100`-`0x014F`.
+ */
 static void finish_checksum(uint8_t header[TRPAK_HEADER_SIZE])
 {
     uint8_t checksum = 0u;
@@ -162,6 +247,14 @@ static void finish_checksum(uint8_t header[TRPAK_HEADER_SIZE])
     header[0x4Du] = checksum;
 }
 
+/**
+ * @brief Builds a valid, minimal cartridge header.
+ *
+ * @param header         Buffer for Game Boy addresses `0x0100`-`0x014F`.
+ * @param cartridge_type Value for Game Boy `0x0147`.
+ * @param rom_size       Value for Game Boy `0x0148`.
+ * @param ram_size       Value for Game Boy `0x0149`.
+ */
 static void create_header(
     uint8_t header[TRPAK_HEADER_SIZE],
     uint8_t cartridge_type,
@@ -177,6 +270,9 @@ static void create_header(
     finish_checksum(header);
 }
 
+/**
+ * @brief Installs the mock backend on port 0 with the test DMA base.
+ */
 static void configure_mock(void)
 {
     trpak_io io;
@@ -191,6 +287,13 @@ static void configure_mock(void)
     assert(trpak_configure_io(&io, 0, MOCK_DMA_BASE) == TRPAK_OK);
 }
 
+/**
+ * @brief Header decoding: sizes, checksum enforcement, argument validation.
+ *
+ * Uses an 8 MiB MBC5 cartridge with 128 KiB of RAM — the largest combination
+ * the size decoders recognize — then flips a title bit to prove that a broken
+ * checksum is rejected rather than parsed.
+ */
 static void test_header_parser(void)
 {
     uint8_t header[TRPAK_HEADER_SIZE];
@@ -216,6 +319,12 @@ static void test_header_parser(void)
         header, sizeof(header), NULL) == TRPAK_ERR_INVALID_ARGUMENT);
 }
 
+/**
+ * @brief trpak_configure_io() rejects incomplete backends and bad ports.
+ *
+ * Covers the three failure modes: no structure at all, a structure missing the
+ * mandatory callbacks, and a controller index past port 4.
+ */
 static void test_configuration_validation(void)
 {
     trpak_io io;
@@ -231,6 +340,23 @@ static void test_configuration_validation(void)
         TRPAK_ERR_INVALID_ARGUMENT);
 }
 
+/**
+ * @brief End-to-end run over the mock: init, dumps, restore, removal, shutdown.
+ *
+ * The simulated cartridge is type `0x08` (ROM + RAM) with 32 KiB of ROM and
+ * 8 KiB of RAM, so no MBC sequence is required and the byte-for-byte
+ * comparisons below check the traversal itself. In order, the test asserts
+ * that:
+ *
+ * - trpak_init() finds the cartridge and decodes the header from the mock ROM;
+ * - the delay callback was used at least for the two power transitions;
+ * - a buffer one byte too small is refused instead of partially filled;
+ * - ROM and RAM copies match the mock images exactly;
+ * - the DMA dump lands in SDRAM identically to the buffer dump;
+ * - a verified DMA restore writes the save back byte for byte;
+ * - setting the removal flag aborts a dump with ::TRPAK_ERR_NO_CARTRIDGE;
+ * - trpak_shutdown() leaves the accessory unpowered and out of access mode.
+ */
 static void test_lifecycle_buffers_and_dma(void)
 {
     uint8_t rom_copy[MOCK_ROM_SIZE];
@@ -238,6 +364,8 @@ static void test_lifecycle_buffers_and_dma(void)
     size_t bytes_read = 0u;
     size_t i;
 
+    /* Fill ROM and RAM with distinct patterns so a mis-ordered or duplicated
+     * block would break the comparisons below. */
     memset(&mock, 0, sizeof(mock));
     for (i = 0u; i < sizeof(mock.rom); i++) {
         mock.rom[i] = (uint8_t)i;
@@ -270,6 +398,8 @@ static void test_lifecycle_buffers_and_dma(void)
     assert(bytes_read == sizeof(mock.rom));
     assert(memcmp(mock.dma, mock.rom, sizeof(mock.rom)) == 0);
 
+    /* Stage a different save image in SDRAM, restore it with verification,
+     * and confirm the cartridge RAM now matches it. */
     for (i = 0u; i < sizeof(mock.ram); i++) {
         mock.dma[i] = (uint8_t)(i ^ 0x5Au);
     }
@@ -286,6 +416,304 @@ static void test_lifecycle_buffers_and_dma(void)
     assert(mock.access == 0u);
 }
 
+/* ------------------------------------------------------------------------ */
+/* Second mock: a faithful MBC1 cartridge                                    */
+/* ------------------------------------------------------------------------ */
+
+/** Full MBC1 address space: 128 banks of 16 KiB. */
+#define MBC1_BANKS 128u
+#define MBC1_ROM_SIZE ((size_t)MBC1_BANKS * TRPAK_ROM_BANK_SIZE)
+/** Four RAM banks, i.e. header RAM size code 0x03. */
+#define MBC1_RAM_BANKS 4u
+#define MBC1_RAM_SIZE ((size_t)MBC1_RAM_BANKS * TRPAK_RAM_BANK_SIZE)
+
+/**
+ * @brief Simulated MBC1 cartridge, registers included.
+ *
+ * Unlike ::mock_transfer_pak, which ignores mapper writes, this mock decodes
+ * the real MBC1 registers and resolves every read through them. That is what
+ * makes the ROM dump test meaningful: a wrong banking sequence produces the
+ * wrong bytes here exactly as it would on hardware.
+ */
+typedef struct mock_mbc1 {
+    uint8_t rom[MBC1_ROM_SIZE]; /**< 2 MiB ROM image. */
+    uint8_t ram[MBC1_RAM_SIZE]; /**< 32 KiB save RAM. */
+    uint8_t power;              /**< Last value written to `0x8000`. */
+    uint8_t access;             /**< Last value written to `0xB000`. */
+    uint8_t window;             /**< Current slice from the `0xA000` register. */
+    uint8_t bank1;              /**< GB `0x2000`-`0x3FFF`, five bits. */
+    uint8_t bank2;              /**< GB `0x4000`-`0x5FFF`, two bits. */
+    uint8_t mode;               /**< GB `0x6000`-`0x7FFF`, banking mode. */
+    bool ram_enabled;           /**< Set by writing `0x0A` to GB `0x0000`. */
+} mock_mbc1;
+
+static mock_mbc1 mbc1;
+
+/** @brief Status byte, same rules as mock_status(). */
+static uint8_t mbc1_status(const mock_mbc1 *state)
+{
+    uint8_t status = state->power == 0x84u ? TRPAK_STATUS_POWERED : 0u;
+
+    if (state->access != 0u && state->power == 0x84u) {
+        status |= TRPAK_STATUS_READY;
+    }
+    return status;
+}
+
+/**
+ * @brief Converts a Transfer Pak window address into a Game Boy address.
+ *
+ * The same `slice * 0x4000 + (address - 0xC000)` arithmetic the real accessory
+ * performs.
+ */
+static uint16_t mbc1_gb_address(const mock_mbc1 *state, uint16_t address)
+{
+    return (uint16_t)((unsigned int)state->window * 0x4000u +
+        (unsigned int)(address - 0xC000u));
+}
+
+/**
+ * @brief Resolves a Game Boy ROM address to an offset in the image.
+ *
+ * The two rules that this whole test exists to exercise: BANK1 written as zero
+ * behaves as one, and in advanced banking mode BANK2 also drives the otherwise
+ * fixed `0x0000`-`0x3FFF` region.
+ */
+static size_t mbc1_rom_offset(const mock_mbc1 *state, uint16_t gb)
+{
+    unsigned int bank;
+
+    if (gb < 0x4000u) {
+        bank = state->mode != 0u ? (unsigned int)state->bank2 << 5 : 0u;
+    } else {
+        bank = ((unsigned int)state->bank2 << 5) |
+            (state->bank1 == 0u ? 1u : state->bank1);
+    }
+
+    return (size_t)bank * TRPAK_ROM_BANK_SIZE + (size_t)(gb & 0x3FFFu);
+}
+
+/** @brief Resolves a Game Boy RAM address; only mode 1 sees banks above 0. */
+static size_t mbc1_ram_offset(const mock_mbc1 *state, uint16_t gb)
+{
+    unsigned int bank = state->mode != 0u ? state->bank2 : 0u;
+
+    return (size_t)bank * TRPAK_RAM_BANK_SIZE + (size_t)(gb - 0xA000u);
+}
+
+/** @brief Mock ::trpak_read_block_fn backed by the MBC1 state above. */
+static int mbc1_read(
+    void *user,
+    int controller,
+    uint16_t address,
+    uint8_t data[TRPAK_TRANSFER_BLOCK_SIZE]
+)
+{
+    mock_mbc1 *state = user;
+    uint16_t gb;
+
+    assert(controller == 0);
+    memset(data, 0, TRPAK_TRANSFER_BLOCK_SIZE);
+
+    if (address == 0x8000u) {
+        data[0] = state->power;
+        return 0;
+    }
+    if (address == 0xB000u) {
+        data[0] = mbc1_status(state);
+        return 0;
+    }
+    if (address < 0xC000u) {
+        return -1;
+    }
+
+    gb = mbc1_gb_address(state, address);
+    if (gb < 0x8000u) {
+        memcpy(data, state->rom + mbc1_rom_offset(state, gb),
+            TRPAK_TRANSFER_BLOCK_SIZE);
+        return 0;
+    }
+    if (gb >= 0xA000u && gb < 0xC000u) {
+        /* Disabled RAM floats high on real cartridges. */
+        if (!state->ram_enabled) {
+            memset(data, 0xFF, TRPAK_TRANSFER_BLOCK_SIZE);
+            return 0;
+        }
+        memcpy(data, state->ram + mbc1_ram_offset(state, gb),
+            TRPAK_TRANSFER_BLOCK_SIZE);
+        return 0;
+    }
+    return -1;
+}
+
+/** @brief Mock ::trpak_write_block_fn that decodes the MBC1 registers. */
+static int mbc1_write(
+    void *user,
+    int controller,
+    uint16_t address,
+    const uint8_t data[TRPAK_TRANSFER_BLOCK_SIZE]
+)
+{
+    mock_mbc1 *state = user;
+    uint16_t gb;
+
+    assert(controller == 0);
+    if (address == 0x8000u) {
+        state->power = data[0] == 0x84u ? 0x84u : 0u;
+        return 0;
+    }
+    if (address == 0xA000u) {
+        state->window = data[0];
+        return 0;
+    }
+    if (address == 0xB000u) {
+        state->access = data[0];
+        return 0;
+    }
+    if (address < 0xC000u) {
+        return -1;
+    }
+
+    gb = mbc1_gb_address(state, address);
+    if (gb < 0x8000u) {
+        /* Register writes move a whole 32-byte block. Modelling them by the
+         * first byte is only faithful if every byte of the block lands in the
+         * same 8 KiB register region, so assert that the library never pokes a
+         * register close enough to a boundary to straddle it. */
+        assert((gb >> 13) ==
+            (uint16_t)((gb + TRPAK_TRANSFER_BLOCK_SIZE - 1u) >> 13));
+
+        if (gb < 0x2000u) {
+            state->ram_enabled = (data[0] & 0x0Fu) == 0x0Au;
+        } else if (gb < 0x4000u) {
+            state->bank1 = (uint8_t)(data[0] & 0x1Fu);
+        } else if (gb < 0x6000u) {
+            state->bank2 = (uint8_t)(data[0] & 0x03u);
+        } else {
+            state->mode = (uint8_t)(data[0] & 0x01u);
+        }
+        return 0;
+    }
+    if (gb >= 0xA000u && gb < 0xC000u) {
+        if (state->ram_enabled) {
+            memcpy(state->ram + mbc1_ram_offset(state, gb), data,
+                TRPAK_TRANSFER_BLOCK_SIZE);
+        }
+        return 0;
+    }
+    return -1;
+}
+
+/**
+ * @brief Installs the MBC1 mock, deliberately without a delay callback.
+ *
+ * Leaving trpak_io::delay unset also covers the optional-callback path: the
+ * library must complete initialization without ever sleeping.
+ */
+static void configure_mbc1_mock(void)
+{
+    trpak_io io;
+
+    memset(&io, 0, sizeof(io));
+    io.read_block = mbc1_read;
+    io.write_block = mbc1_write;
+    io.user = &mbc1;
+    assert(trpak_configure_io(&io, 0, MOCK_DMA_BASE) == TRPAK_OK);
+}
+
+/**
+ * @brief Full dump of a 2 MiB MBC1 cartridge, plus its four RAM banks.
+ *
+ * The point of the test is the set of banks BANK1 cannot express — `0x20`,
+ * `0x40` and `0x60` — which are only reachable through the fixed region in
+ * advanced banking mode. Each ROM byte encodes its own bank number, so a bank
+ * served from the wrong window, or silently substituted by the mapper's
+ * "written as 0, reads as 1" rule, breaks the comparison.
+ *
+ * It also covers RAM banking on MBC1, which shares the mode register with ROM
+ * banking, and the rejection of a header claiming more banks than MBC1 can
+ * address.
+ */
+static void test_mbc1_large_rom(void)
+{
+    static uint8_t rom_copy[MBC1_ROM_SIZE];
+    static uint8_t save_copy[MBC1_RAM_SIZE];
+    static uint8_t restored[MBC1_RAM_SIZE];
+    size_t bytes_read = 0u;
+    size_t i;
+
+    memset(&mbc1, 0, sizeof(mbc1));
+    for (i = 0u; i < sizeof(mbc1.rom); i++) {
+        /* Bank index XOR a position-dependent value: unique per bank, and
+         * varying within each bank. */
+        mbc1.rom[i] = (uint8_t)((i / TRPAK_ROM_BANK_SIZE) ^ (i * 31u));
+    }
+    for (i = 0u; i < sizeof(mbc1.ram); i++) {
+        mbc1.ram[i] = (uint8_t)(i * 7u + 1u);
+    }
+    /* MBC1 + RAM + BATTERY, 128 banks (2 MiB), 32 KiB of RAM. */
+    create_header(mbc1.rom + 0x100u, 0x03u, 0x06u, 0x03u);
+    configure_mbc1_mock();
+
+    assert(trpak_init() == TRPAK_OK);
+    assert(trcart.mapper == TRPAK_MAPPER_MBC1);
+    assert(trcart.rombanks == MBC1_BANKS);
+    assert(trcart.romsize == MBC1_ROM_SIZE);
+    assert(trcart.rambanks == MBC1_RAM_BANKS);
+
+    assert(trpak_read_rom(rom_copy, sizeof(rom_copy), &bytes_read) == TRPAK_OK);
+    assert(bytes_read == sizeof(mbc1.rom));
+    assert(memcmp(rom_copy, mbc1.rom, sizeof(mbc1.rom)) == 0);
+
+    /* Redundant after the comparison above, but names the banks that used to
+     * be unreachable and made this cartridge undumpable. */
+    for (i = 0x20u; i <= 0x60u; i += 0x20u) {
+        size_t base = i * TRPAK_ROM_BANK_SIZE;
+        assert(memcmp(rom_copy + base, mbc1.rom + base,
+            TRPAK_ROM_BANK_SIZE) == 0);
+    }
+
+    /* The dump must leave the cartridge in its resting configuration. */
+    assert(trcart.bank == 0u);
+    assert(mbc1.mode == 0u);
+
+    assert(trpak_read_save(save_copy, sizeof(save_copy), &bytes_read) ==
+        TRPAK_OK);
+    assert(bytes_read == sizeof(mbc1.ram));
+    assert(memcmp(save_copy, mbc1.ram, sizeof(mbc1.ram)) == 0);
+
+    for (i = 0u; i < sizeof(restored); i++) {
+        restored[i] = (uint8_t)(0xFFu - (i & 0xFFu));
+    }
+    assert(trpak_write_save(restored, sizeof(restored), true) == TRPAK_OK);
+    assert(memcmp(mbc1.ram, restored, sizeof(restored)) == 0);
+    /* RAM must be protected again once the operation ends, and the mode
+     * register must be back to simple banking so that the fixed region shows
+     * bank 0 again. */
+    assert(!mbc1.ram_enabled);
+    assert(mbc1.mode == 0u);
+
+    /* A header claiming 4 MiB is beyond BANK2's two bits, so the dump is
+     * refused instead of wrapping. The DMA entry point is used only because
+     * it skips the buffer-capacity check, which would otherwise reject the
+     * call first and hide the mapper limit being tested. */
+    create_header(mbc1.rom + 0x100u, 0x03u, 0x07u, 0x03u);
+    assert(trpak_init() == TRPAK_OK);
+    assert(trcart.rombanks == 256u);
+    assert(trpak_read_rom_dma(NULL) == TRPAK_ERR_UNSUPPORTED_CARTRIDGE);
+
+    assert(trpak_shutdown() == TRPAK_OK);
+    assert(mbc1.power == 0u);
+    assert(mbc1.access == 0u);
+}
+
+/**
+ * @brief Argument checking in the low-level accessors.
+ *
+ * Covers a misaligned ROM address, one past the last full block, a RAM address
+ * below the RAM window, a NULL buffer, and the supported/unsupported answers
+ * of trpak_mapper_is_supported().
+ */
 static void test_api_boundaries(void)
 {
     uint8_t block[TRPAK_TRANSFER_BLOCK_SIZE];
@@ -302,11 +730,20 @@ static void test_api_boundaries(void)
     assert(!trpak_mapper_is_supported(TRPAK_MAPPER_MBC4));
 }
 
+/**
+ * @brief Runs the suite; any failed assertion aborts the process.
+ *
+ * The order matters only in that test_api_boundaries() runs after the
+ * lifecycle test, reusing the backend it configured.
+ *
+ * @return `0` when every assertion held.
+ */
 int main(void)
 {
     test_header_parser();
     test_configuration_validation();
     test_lifecycle_buffers_and_dma();
+    test_mbc1_large_rom();
     test_api_boundaries();
     puts("libtrpak tests: OK");
     return 0;

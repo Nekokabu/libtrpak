@@ -1,3 +1,26 @@
+# Host build for libtrpak.
+#
+# Nothing here builds an N64 ROM: the goal is to exercise the library's logic
+# on a PC. Two independent targets are produced.
+#
+#   tests/test_libtrpak            The test suite. libtrpak.c is compiled with
+#                                  TRPAK_NO_DEFAULT_IO, so the libdragon
+#                                  backend is removed and the tests install a
+#                                  simulated Transfer Pak instead.
+#
+#   tests/libtrpak_default_backend.o
+#                                  Compile-only check of the platform layer.
+#                                  It builds libtrpak.c with the default
+#                                  backend and TRPAK_ENABLE_ED64_DMA against
+#                                  the stub headers in tests/stubs, catching
+#                                  renamed or retyped libdragon/EverDrive
+#                                  functions without an N64 toolchain. It is
+#                                  never linked or run.
+#
+# Usage: `make test` builds both and runs the suite. Override HOST_CC or
+# HOST_CFLAGS to test other compilers or standards; -Werror is intentional, as
+# the library is meant to stay warning-free.
+
 HOST_CC ?= cc
 HOST_CFLAGS ?= -std=c11 -O2 -Wall -Wextra -Werror -pedantic
 TEST_BINARY := tests/test_libtrpak

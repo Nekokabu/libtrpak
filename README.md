@@ -306,7 +306,7 @@ The largest currently recognized ROM size code represents 8 MiB. The largest rec
 | Family | Status | Notes |
 | --- | --- | --- |
 | ROM without MBC | Implemented | Non-banked ROM and RAM are supported. |
-| MBC1 | Partial and conservative | Dumps of up to 32 banks; larger ROMs are rejected to prevent incomplete dumps. |
+| MBC1 | Implemented | Full 128 banks (2 MiB). Banks `0x20`, `0x40`, and `0x60` are read through the fixed window in advanced banking mode, since the 5-bit register cannot select them. Multicart (MBC1M) wiring is not detected. |
 | MBC2 | Implemented | 512-byte internal RAM is normalized to the lower nibble. |
 | MMM01 | Detected, not implemented | Initialization returns an unsupported-cartridge error. |
 | MBC3/MBC30 | ROM/RAM implemented | MBC30 supports all eight banks of a 64 KiB save. RTC is not controlled yet. |
@@ -335,7 +335,10 @@ The tests compile `libtrpak.c` with `TRPAK_NO_DEFAULT_IO`, install a simulated b
 - DMA ROM dumping and verified save restoration;
 - interruption when a cartridge is removed;
 - alignment and bounds of 32-byte accesses;
-- explicit rejection of an unimplemented mapper.
+- explicit rejection of an unimplemented mapper;
+- a full 2 MiB dump against a mock that emulates the real MBC1 registers,
+  covering banks `0x20`, `0x40`, and `0x60`, RAM banking, and the rejection of
+  headers claiming more banks than MBC1 can address.
 
 The target also compiles the default backend against stubs containing the current Joybus, delay, cache, and DMA signatures, preventing name or type regressions in that layer.
 
@@ -344,7 +347,8 @@ Host tests do not validate electrical timing, physical cartridge behavior, or th
 ## Limitations and next steps
 
 - Validate each mapper's command sequence on real hardware.
-- Implement full MBC1 reads above 32 banks through the fixed window in mode 1.
+- Detect MBC1 multicart (MBC1M) wiring, whose 4-bit bank register makes the
+  standard sequence produce a wrong dump.
 - Add automatic backup through a callback before restoration.
 - Add progress and cancellation callbacks.
 - Implement MBC3 RTC, MBC5 rumble, and Game Boy Camera registers.
