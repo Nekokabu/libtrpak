@@ -107,10 +107,11 @@
  * @brief Backend and addressing state shared by every operation.
  */
 typedef struct trpak_runtime {
-    trpak_io io;        /**< Installed transport callbacks. */
-    int controller;     /**< Controller port index passed to the callbacks. */
-    uintptr_t dma_base; /**< Base address used by the DMA helpers. */
-    bool configured;    /**< False until a usable backend is installed. */
+    trpak_io io;         /**< Installed transport callbacks. */
+    int controller;      /**< Controller port index passed to the callbacks. */
+    uintptr_t dma_base;  /**< Base address used by the DMA helpers. */
+    bool mbc1_multicart; /**< True when the inserted MBC1 uses MBC1M wiring. */
+    bool configured;     /**< False until a usable backend is installed. */
 } trpak_runtime;
 
 /** Single global runtime; zero-initialized, so `configured` starts false. */
@@ -273,6 +274,7 @@ int trpak_configure_io(const trpak_io *io, int controller, uintptr_t dma_base)
     runtime.io = *io;
     runtime.controller = controller;
     runtime.dma_base = dma_base;
+    runtime.mbc1_multicart = false;
     runtime.configured = true;
     return TRPAK_OK;
 }
@@ -477,9 +479,9 @@ int trpak_get_access_state(int *state)
 /**
  * @brief Verifies the accessory is still safe to talk to.
  *
- * Called before every block of every bulk operation, which is what lets a dump
- * or restore abort as soon as the cartridge is pulled out instead of writing
- * garbage.
+ * Called before and after every data transaction in a bulk operation. This is
+ * what lets a dump or restore abort when the cartridge is pulled out and also
+ * closes the reset race between a pre-flight status read and the transaction.
  *
  * A reset that already finished is reported separately through `was_reset`
  * rather than as an error. The accessory is perfectly usable afterwards, but
@@ -527,26 +529,44 @@ static int check_cartridge_ready(bool *was_reset)
 /**
  * @brief Polls until the cartridge is ready, or the budget runs out.
  *
- * Only transient conditions are retried. Success, an absent cartridge, and an
- * I/O failure all return immediately, since none of them improve by waiting;
- * "not ready yet" and "resetting" are the states worth polling through.
+ * Only transient conditions are retried. An absent cartridge, power loss, and
+ * an I/O failure all return immediately, since none of them improve by
+ * waiting; "not ready yet" and "resetting" are the states worth polling
+ * through. `was_reset` accumulates the read-and-clear reset latch across every
+ * poll, so a reset observed while booting is still reported once ready.
  *
+ * @param was_reset Optional; receives whether any poll observed a completed
+ *                  reset. Pass NULL to consume and ignore the latch.
  * @retval TRPAK_OK                   Cartridge became ready.
  * @retval TRPAK_ERR_NO_CARTRIDGE     No cartridge inserted.
+ * @retval TRPAK_ERR_POWER_OFF        Accessory power is off.
  * @retval TRPAK_ERR_IO               Status read failed.
  * @retval TRPAK_ERR_TRANSFER_TIMEOUT Still not ready after ~500 ms.
  */
-static int wait_for_cartridge_ready(void)
+static int wait_for_cartridge_ready(bool *was_reset)
 {
     unsigned int attempt;
     int result;
+    bool reset_seen = false;
+
+    if (was_reset != NULL) {
+        *was_reset = false;
+    }
 
     for (attempt = 0u; attempt < TP_READY_POLL_ATTEMPTS; attempt++) {
-        /* The reset latch is irrelevant here: nothing is banked yet, and
-         * powering up sets it by definition. */
-        result = check_cartridge_ready(NULL);
-        if (result == TRPAK_OK || result == TRPAK_ERR_NO_CARTRIDGE ||
-            result == TRPAK_ERR_IO) {
+        bool reset_on_this_read = false;
+
+        result = check_cartridge_ready(&reset_on_this_read);
+        reset_seen = reset_seen || reset_on_this_read;
+        if (result == TRPAK_OK) {
+            if (was_reset != NULL) {
+                *was_reset = reset_seen;
+            }
+            return result;
+        }
+        /* Only access/reset-in-progress is transient. Power loss, removal and
+         * transport errors cannot be repaired by waiting. */
+        if (result != TRPAK_ERR_ACCESS_STATE) {
             return result;
         }
         if (runtime.io.delay != NULL) {
@@ -879,8 +899,19 @@ int trpak_parse_cartridge_header(
     out->_romsize = header[0x48];
     out->_ramsize = header[0x49];
 
-    /* CGB cartridges gave up the 16th title byte to the flag at 0x0143. */
+    /* CGB headers exist in two layouts without an explicit version marker.
+     * Early ones retain a 15-byte title; newer ones use 0x013F-0x0142 for a
+     * four-character manufacturer code and therefore have an 11-byte title.
+     * Infer the newer form from four printable bytes. Zero-padded suffixes
+     * stay on the old 15-byte interpretation. */
     title_length = out->gbc != 0u ? 15u : 16u;
+    if (out->gbc != 0u &&
+        header[0x3Fu] >= 0x20u && header[0x3Fu] <= 0x7Eu &&
+        header[0x40u] >= 0x20u && header[0x40u] <= 0x7Eu &&
+        header[0x41u] >= 0x20u && header[0x41u] <= 0x7Eu &&
+        header[0x42u] >= 0x20u && header[0x42u] <= 0x7Eu) {
+        title_length = 11u;
+    }
     memcpy(out->title, &header[0x34], title_length);
     out->title[title_length] = '\0';
 
@@ -941,7 +972,8 @@ static uint16_t mapper_max_rom_bank(uint8_t mapper)
 {
     switch (mapper) {
     case TRPAK_MAPPER_NONE:   return 0x001u; /* Window slices 0 and 1.   */
-    case TRPAK_MAPPER_MBC1:   return 0x07Fu; /* BANK2:BANK1, 2+5 bits.   */
+    case TRPAK_MAPPER_MBC1:
+        return runtime.mbc1_multicart ? 0x03Fu : 0x07Fu;
     case TRPAK_MAPPER_MBC2:   return 0x00Fu; /* Four bits.               */
     case TRPAK_MAPPER_MBC3:   return 0x07Fu; /* Seven bits.              */
     case TRPAK_MAPPER_MBC5:   return 0x1FFu; /* Nine bits over two regs. */
@@ -954,10 +986,11 @@ static uint16_t mapper_max_rom_bank(uint8_t mapper)
 /**
  * @brief Highest RAM bank index the mapper's registers can safely select.
  *
- * Counterpart of mapper_max_rom_bank(). Two limits are narrower than the
- * register itself: MBC3 stops at 7 because higher values address the RTC
- * registers rather than RAM, and a rumble MBC5 stops at 7 because the next bit
- * of the same register drives the motor.
+ * Counterpart of mapper_max_rom_bank(). MBC1M uses its two-bit register for
+ * ROM selection and therefore has only one fixed RAM bank. Two other limits
+ * are narrower than the register itself: MBC3 stops at 7 because higher values
+ * address the RTC registers rather than RAM, and a rumble MBC5 stops at 7
+ * because the next bit of the same register drives the motor.
  *
  * @param mapper One of the `TRPAK_MAPPER_*` identifiers.
  * @param rumble Non-zero for an MBC5 cartridge with a rumble motor.
@@ -968,7 +1001,8 @@ static uint16_t mapper_max_ram_bank(uint8_t mapper, bool rumble)
 {
     switch (mapper) {
     case TRPAK_MAPPER_NONE:   return 0x0u; /* Unbanked.                  */
-    case TRPAK_MAPPER_MBC1:   return 0x3u; /* Two bits.                  */
+    case TRPAK_MAPPER_MBC1:
+        return runtime.mbc1_multicart ? 0x0u : 0x3u;
     case TRPAK_MAPPER_MBC2:   return 0x0u; /* One internal bank.         */
     case TRPAK_MAPPER_MBC3:   return 0x7u; /* Above 7 selects the RTC.   */
     case TRPAK_MAPPER_MBC5:   return rumble ? 0x7u : 0xFu;
@@ -1011,7 +1045,8 @@ static int bank_count_fits_mapper(uint16_t banks, uint16_t max_bank)
  * The window slice this function leaves behind is part of its contract: the
  * caller always reads the same Transfer Pak addresses (`0xC000`-`0xFFE0`) and
  * relies on this function to have pointed them at the requested bank. MBC1
- * uses that freedom to serve banks `0x20`/`0x40`/`0x60` through slice 0.
+ * uses that freedom to serve banks `0x20`/`0x40`/`0x60` through slice 0 on a
+ * conventional cartridge, or `0x10`/`0x20`/`0x30` on MBC1M.
  */
 int trpak_select_rom_bank(uint16_t bank)
 {
@@ -1052,15 +1087,18 @@ int trpak_select_rom_bank(uint16_t bank)
      * circuits the rest and is returned as-is. */
     switch (trcart.mapper) {
     case TRPAK_MAPPER_MBC1: {
-        uint8_t lower = (uint8_t)(bank & 0x1Fu);        /* BANK1, GB 0x2000 */
-        uint8_t upper = (uint8_t)((bank >> 5) & 0x03u); /* BANK2, GB 0x4000 */
+        uint8_t lower_mask = runtime.mbc1_multicart ? 0x0Fu : 0x1Fu;
+        unsigned int upper_shift = runtime.mbc1_multicart ? 4u : 5u;
+        uint8_t lower = (uint8_t)(bank & lower_mask); /* BANK1, GB 0x2000 */
+        uint8_t upper = (uint8_t)((bank >> upper_shift) & 0x03u);
 
         if (lower == 0u) {
-            /* BANK1 reads back as 1 when written as 0, so banks 0x00, 0x20,
-             * 0x40 and 0x60 can never appear in the switchable region. In
-             * advanced banking mode (1) BANK2 is applied to the fixed region
-             * as well, which puts exactly those four banks at GB 0x0000, so
-             * the window is left on slice 0 for the caller to read.
+            /* BANK1 reads back as 1 when its effective value is 0, so banks
+             * 0x00/0x20/0x40/0x60 (or 0x00/0x10/0x20/0x30 on MBC1M) cannot
+             * appear in the switchable region. In advanced banking mode (1),
+             * BANK2 is applied to the fixed region as well, which puts exactly
+             * those four banks at GB 0x0000. Leave the window on slice 0 so the
+             * caller can read them.
              *
              * Bank 0 is the one case that needs no mode change: it is what
              * the fixed region shows in simple mode (0), which is also the
@@ -1414,10 +1452,11 @@ static int load_input(
  * @brief Shared ROM dump loop behind trpak_read_rom() and trpak_read_rom_dma().
  *
  * Two nested loops: banks on the outside, 32-byte blocks across the window on
- * the inside. Presence is re-checked before every single block, so a cartridge
- * pulled out mid-dump aborts with ::TRPAK_ERR_NO_CARTRIDGE instead of silently
- * recording garbage. Whatever happens, the window is put back on bank 0 before
- * returning, and `bytes_read` reports the bytes that really made it out.
+ * the inside. Status is checked before and after every data transaction, so a
+ * cartridge pulled out mid-dump aborts with ::TRPAK_ERR_NO_CARTRIDGE and a
+ * reset in the pre-flight race window causes the same block to be retried.
+ * Whatever happens, the window is put back on bank 0 before returning, and
+ * `bytes_read` reports the bytes that really made it out.
  *
  * @param destination Caller buffer, or NULL in DMA mode.
  * @param capacity    Size of that buffer, or 0 in DMA mode.
@@ -1464,7 +1503,7 @@ static int read_rom_internal(
 
         /* NULL: a reset before the bank is selected costs nothing, and
          * consuming the latch here gives the inner loop a clean baseline. */
-        result = check_cartridge_ready(NULL);
+        result = wait_for_cartridge_ready(NULL);
         if (result != TRPAK_OK) {
             break;
         }
@@ -1478,33 +1517,58 @@ static int read_rom_internal(
         for (address = TP_ROM_WINDOW_START;
              address <= TP_WINDOW_END;
              address += TRPAK_TRANSFER_BLOCK_SIZE) {
-            bool was_reset = false;
+            unsigned int retry = 0u;
 
-            result = check_cartridge_ready(&was_reset);
-            if (result != TRPAK_OK) {
-                break;
-            }
-            if (was_reset) {
-                /* The accessory reset since the previous block, so the mapper
-                 * is back at its power-on state and the bank selected above is
-                 * gone. Re-select it: without this the rest of the bank is
-                 * read from whichever bank the mapper defaults to, and the
-                 * dump records it as if nothing had happened. */
-                result = trpak_select_rom_bank(bank);
+            for (;;) {
+                bool was_reset = false;
+
+                result = wait_for_cartridge_ready(&was_reset);
                 if (result != TRPAK_OK) {
                     break;
                 }
+                if (was_reset) {
+                    result = trpak_select_rom_bank(bank);
+                    if (result != TRPAK_OK) {
+                        break;
+                    }
+                }
+
+                result = trpak_read_rom_block((uint16_t)address, block);
+                if (result != TRPAK_OK) {
+                    break;
+                }
+
+                /* A reset can happen after the pre-flight status read but
+                 * before the data transaction. Check again before trusting the
+                 * block and repeat the same address if its bank latch changed. */
+                was_reset = false;
+                result = wait_for_cartridge_ready(&was_reset);
+                if (result != TRPAK_OK) {
+                    break;
+                }
+                if (was_reset) {
+                    if (++retry >= TP_READY_POLL_ATTEMPTS) {
+                        result = TRPAK_ERR_TRANSFER_TIMEOUT;
+                        break;
+                    }
+                    result = trpak_select_rom_bank(bank);
+                    if (result != TRPAK_OK) {
+                        break;
+                    }
+                    continue;
+                }
+
+                result = store_output(
+                    destination, capacity, offset, block, use_dma);
+                if (result == TRPAK_OK) {
+                    offset += TRPAK_TRANSFER_BLOCK_SIZE;
+                }
+                break;
             }
-            result = trpak_read_rom_block((uint16_t)address, block);
+
             if (result != TRPAK_OK) {
                 break;
             }
-            result = store_output(
-                destination, capacity, offset, block, use_dma);
-            if (result != TRPAK_OK) {
-                break;
-            }
-            offset += TRPAK_TRANSFER_BLOCK_SIZE;
         }
 
         if (result != TRPAK_OK) {
@@ -1635,7 +1699,7 @@ static int read_save_internal(
         size_t bank_size = ram_bytes_for_bank(bank);
         size_t bank_offset;
 
-        result = check_cartridge_ready(NULL);
+        result = wait_for_cartridge_ready(NULL);
         if (result != TRPAK_OK) {
             break;
         }
@@ -1647,34 +1711,57 @@ static int read_save_internal(
         for (bank_offset = 0u; bank_offset < bank_size;
              bank_offset += TRPAK_TRANSFER_BLOCK_SIZE) {
             uint16_t address = (uint16_t)(TP_RAM_WINDOW_START + bank_offset);
-            bool was_reset = false;
+            unsigned int retry = 0u;
 
-            result = check_cartridge_ready(&was_reset);
-            if (result != TRPAK_OK) {
-                break;
-            }
-            if (was_reset) {
-                /* A reset re-locks cartridge RAM as well as clearing the bank
-                 * register, so the remaining blocks would read the floating
-                 * bus instead of the save. Re-selecting the bank does both. */
-                result = trpak_select_ram_bank(bank);
+            for (;;) {
+                bool was_reset = false;
+
+                result = wait_for_cartridge_ready(&was_reset);
                 if (result != TRPAK_OK) {
                     break;
                 }
+                if (was_reset) {
+                    result = trpak_select_ram_bank(bank);
+                    if (result != TRPAK_OK) {
+                        break;
+                    }
+                }
+                result = trpak_read_ram_block(address, block);
+                if (result != TRPAK_OK) {
+                    break;
+                }
+
+                was_reset = false;
+                result = wait_for_cartridge_ready(&was_reset);
+                if (result != TRPAK_OK) {
+                    break;
+                }
+                if (was_reset) {
+                    if (++retry >= TP_READY_POLL_ATTEMPTS) {
+                        result = TRPAK_ERR_TRANSFER_TIMEOUT;
+                        break;
+                    }
+                    result = trpak_select_ram_bank(bank);
+                    if (result != TRPAK_OK) {
+                        break;
+                    }
+                    continue;
+                }
+
+                if (trcart.mapper == TRPAK_MAPPER_MBC2) {
+                    normalize_mbc2_block(block);
+                }
+                result = store_output(
+                    destination, capacity, offset, block, use_dma);
+                if (result == TRPAK_OK) {
+                    offset += TRPAK_TRANSFER_BLOCK_SIZE;
+                }
+                break;
             }
-            result = trpak_read_ram_block(address, block);
+
             if (result != TRPAK_OK) {
                 break;
             }
-            if (trcart.mapper == TRPAK_MAPPER_MBC2) {
-                normalize_mbc2_block(block);
-            }
-            result = store_output(
-                destination, capacity, offset, block, use_dma);
-            if (result != TRPAK_OK) {
-                break;
-            }
-            offset += TRPAK_TRANSFER_BLOCK_SIZE;
         }
 
         if (result != TRPAK_OK) {
@@ -1742,7 +1829,7 @@ static int write_save_internal(
         size_t bank_size = ram_bytes_for_bank(bank);
         size_t bank_offset;
 
-        result = check_cartridge_ready(NULL);
+        result = wait_for_cartridge_ready(NULL);
         if (result != TRPAK_OK) {
             break;
         }
@@ -1754,55 +1841,87 @@ static int write_save_internal(
         for (bank_offset = 0u; bank_offset < bank_size;
              bank_offset += TRPAK_TRANSFER_BLOCK_SIZE) {
             uint16_t address = (uint16_t)(TP_RAM_WINDOW_START + bank_offset);
-            bool was_reset = false;
+            unsigned int retry = 0u;
 
-            result = check_cartridge_ready(&was_reset);
-            if (result != TRPAK_OK) {
-                break;
-            }
-            if (was_reset) {
-                /* Same recovery as the backup path, and it matters more here:
-                 * with RAM re-locked by the reset the cartridge silently drops
-                 * every write, so a restore would report success over a save
-                 * that was never stored. */
-                result = trpak_select_ram_bank(bank);
+            for (;;) {
+                bool was_reset = false;
+
+                result = wait_for_cartridge_ready(&was_reset);
                 if (result != TRPAK_OK) {
                     break;
                 }
-            }
-            result = load_input(source, size, offset, block, use_dma);
-            if (result != TRPAK_OK) {
-                break;
-            }
-            if (trcart.mapper == TRPAK_MAPPER_MBC2) {
-                /* Mask the source too, so verification compares what the
-                 * cartridge can actually store. */
-                normalize_mbc2_block(block);
-            }
-
-            result = trpak_write_ram_block(address, block);
-            if (result != TRPAK_OK) {
-                break;
-            }
-
-            if (verify_after_write) {
-                result = check_cartridge_ready(NULL);
-                if (result != TRPAK_OK) {
-                    break;
+                if (was_reset) {
+                    result = trpak_select_ram_bank(bank);
+                    if (result != TRPAK_OK) {
+                        break;
+                    }
                 }
-                result = trpak_read_ram_block(address, verification);
+                result = load_input(source, size, offset, block, use_dma);
                 if (result != TRPAK_OK) {
                     break;
                 }
                 if (trcart.mapper == TRPAK_MAPPER_MBC2) {
-                    normalize_mbc2_block(verification);
+                    normalize_mbc2_block(block);
                 }
-                if (memcmp(block, verification, sizeof(block)) != 0) {
-                    result = TRPAK_ERR_VERIFY_FAILED;
+
+                result = trpak_write_ram_block(address, block);
+                if (result != TRPAK_OK) {
                     break;
                 }
+
+                was_reset = false;
+                result = wait_for_cartridge_ready(&was_reset);
+                if (result != TRPAK_OK) {
+                    break;
+                }
+                if (was_reset) {
+                    if (++retry >= TP_READY_POLL_ATTEMPTS) {
+                        result = TRPAK_ERR_TRANSFER_TIMEOUT;
+                        break;
+                    }
+                    result = trpak_select_ram_bank(bank);
+                    if (result != TRPAK_OK) {
+                        break;
+                    }
+                    continue;
+                }
+
+                if (verify_after_write) {
+                    result = trpak_read_ram_block(address, verification);
+                    if (result != TRPAK_OK) {
+                        break;
+                    }
+                    was_reset = false;
+                    result = wait_for_cartridge_ready(&was_reset);
+                    if (result != TRPAK_OK) {
+                        break;
+                    }
+                    if (was_reset) {
+                        if (++retry >= TP_READY_POLL_ATTEMPTS) {
+                            result = TRPAK_ERR_TRANSFER_TIMEOUT;
+                            break;
+                        }
+                        result = trpak_select_ram_bank(bank);
+                        if (result != TRPAK_OK) {
+                            break;
+                        }
+                        continue;
+                    }
+                    if (trcart.mapper == TRPAK_MAPPER_MBC2) {
+                        normalize_mbc2_block(verification);
+                    }
+                    if (memcmp(block, verification, sizeof(block)) != 0) {
+                        result = TRPAK_ERR_VERIFY_FAILED;
+                        break;
+                    }
+                }
+                offset += TRPAK_TRANSFER_BLOCK_SIZE;
+                break;
             }
-            offset += TRPAK_TRANSFER_BLOCK_SIZE;
+
+            if (result != TRPAK_OK) {
+                break;
+            }
         }
 
         if (result != TRPAK_OK) {
@@ -1855,6 +1974,68 @@ int trpak_write_save_dma(bool verify_after_write)
 /* 8. Lifecycle and diagnostics                                              */
 /* ------------------------------------------------------------------------ */
 
+/** Reads the 80-byte cartridge header from whichever ROM bank is exposed. */
+static int read_current_rom_header(uint8_t header[TRPAK_HEADER_SIZE])
+{
+    uint8_t block[TRPAK_TRANSFER_BLOCK_SIZE];
+    int result;
+
+    result = trpak_read_rom_block(0xC100u, block);
+    if (result != TRPAK_OK) {
+        return result;
+    }
+    memcpy(&header[0x00], block, TRPAK_TRANSFER_BLOCK_SIZE);
+
+    result = trpak_read_rom_block(0xC120u, block);
+    if (result != TRPAK_OK) {
+        return result;
+    }
+    memcpy(&header[0x20], block, TRPAK_TRANSFER_BLOCK_SIZE);
+
+    result = trpak_read_rom_block(0xC140u, block);
+    if (result != TRPAK_OK) {
+        return result;
+    }
+    memcpy(&header[0x40], block, 16u);
+    return TRPAK_OK;
+}
+
+/**
+ * Detects the alternate MBC1M wiring used by 1 MiB compilation cartridges.
+ * With conventional MBC1 sequencing, selecting bank 0x10 maps bank 0 on an
+ * MBC1M because the main register's bit 4 is not connected. A second valid
+ * copy of bank 0's logo/header there is the standard hardware probe.
+ */
+static int detect_mbc1_multicart(const uint8_t base_header[TRPAK_HEADER_SIZE])
+{
+    uint8_t candidate[TRPAK_HEADER_SIZE];
+    int result;
+
+    runtime.mbc1_multicart = false;
+    if (trcart.mapper != TRPAK_MAPPER_MBC1 || trcart.rombanks != 64u) {
+        return TRPAK_OK;
+    }
+
+    result = trpak_select_rom_bank(0x10u);
+    if (result == TRPAK_OK) {
+        memset(candidate, 0, sizeof(candidate));
+        result = read_current_rom_header(candidate);
+    }
+    if (result == TRPAK_OK &&
+        trpak_check_header_checksum(candidate, sizeof(candidate)) &&
+        memcmp(&candidate[0x04], &base_header[0x04], 48u) == 0) {
+        runtime.mbc1_multicart = true;
+    }
+
+    {
+        int reset_result = trpak_select_rom_bank(0u);
+        if (result == TRPAK_OK) {
+            result = reset_result;
+        }
+    }
+    return result;
+}
+
 /**
  * @brief Powers the accessory down after a failed bring-up.
  *
@@ -1886,7 +2067,6 @@ static int fail_initialization(int result)
 int trpak_init(void)
 {
     uint8_t header[TRPAK_HEADER_SIZE];
-    uint8_t block[TRPAK_TRANSFER_BLOCK_SIZE];
     bool power;
     int result;
 
@@ -1896,6 +2076,7 @@ int trpak_init(void)
 
     memset(&trcart, 0, sizeof(trcart));
     memset(header, 0, sizeof(header));
+    runtime.mbc1_multicart = false;
 
     /* Step 1: force a known-off state and verify the accessory answers. */
     result = trpak_set_power(false);
@@ -1928,7 +2109,7 @@ int trpak_init(void)
     if (result != TRPAK_OK) {
         return fail_initialization(result);
     }
-    result = wait_for_cartridge_ready();
+    result = wait_for_cartridge_ready(NULL);
     if (result != TRPAK_OK) {
         return fail_initialization(result);
     }
@@ -1942,24 +2123,10 @@ int trpak_init(void)
     }
 
     /* Step 5: read Game Boy 0x0100-0x014F in three window transactions. */
-    result = trpak_read_rom_block(0xC100u, block);
+    result = read_current_rom_header(header);
     if (result != TRPAK_OK) {
         return fail_initialization(result);
     }
-    memcpy(&header[0x00], block, TRPAK_TRANSFER_BLOCK_SIZE);
-
-    result = trpak_read_rom_block(0xC120u, block);
-    if (result != TRPAK_OK) {
-        return fail_initialization(result);
-    }
-    memcpy(&header[0x20], block, TRPAK_TRANSFER_BLOCK_SIZE);
-
-    result = trpak_read_rom_block(0xC140u, block);
-    if (result != TRPAK_OK) {
-        return fail_initialization(result);
-    }
-    /* Only 16 of the 32 bytes read belong to the header. */
-    memcpy(&header[0x40], block, 16u);
 
     /* Step 6: decode, then refuse cartridges whose mapper has no banking
      * implementation rather than letting a later dump produce garbage. */
@@ -1969,6 +2136,13 @@ int trpak_init(void)
     }
     if (!trpak_mapper_is_supported(trcart.mapper)) {
         return fail_initialization(TRPAK_ERR_UNSUPPORTED_CARTRIDGE);
+    }
+
+    /* Step 7: 1 MiB MBC1 multicarts use different register wiring that is not
+     * represented in the header. Probe bank 0x10 before any bulk traversal. */
+    result = detect_mbc1_multicart(header);
+    if (result != TRPAK_OK) {
+        return fail_initialization(result);
     }
 
     return TRPAK_OK;

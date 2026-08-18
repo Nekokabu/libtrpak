@@ -25,9 +25,11 @@ The project uses [libdragon](https://github.com/DragonMinded/libdragon) to contr
 - Save restoration with mandatory size validation and read-after-write verification.
 - Normalization of the MBC2 internal RAM's 4-bit values.
 - RAM and accessory-state cleanup after operations and failures.
-- Cartridge-removal detection before each block of a bulk operation.
-- Recovery from an accessory reset mid-transfer, which silently invalidates the
-  selected bank and re-locks cartridge RAM.
+- Cartridge-removal detection before and after each block transaction.
+- Recovery from an accessory reset mid-transfer, including the race after a
+  pre-flight status read; the affected block is retried after restoring mapper
+  state and unlocking RAM.
+- Automatic MBC1M multicart detection and correct 64-bank ROM traversal.
 - Refusal of headers declaring more banks than the mapper can select, before
   any data moves, rather than a partial or wrapped image.
 - RAM kept locked when a bank is rejected, so a refused call cannot leave a
@@ -177,10 +179,11 @@ Restoration requires `size` to be exactly equal to `trcart.ramsize`. When `verif
 > Always create and persist a backup before restoring a save. Verification detects write differences, but it does not replace an external backup or recover previously overwritten data.
 
 Do not remove the cartridge or Transfer Pak during an operation; removal is
-detected before each block and aborts with `TRPAK_ERR_NO_CARTRIDGE`. An
-accessory reset is recovered from instead, since it leaves a usable cartridge
-behind. Bulk routines attempt to disable RAM even if an intermediate failure
-occurs.
+detected around each block transaction and aborts with
+`TRPAK_ERR_NO_CARTRIDGE`. An accessory reset is recovered from instead, since
+it leaves a usable cartridge behind. The affected block is repeated only after
+the mapper bank has been restored and RAM re-enabled. Bulk routines attempt to
+disable RAM even if an intermediate failure occurs.
 
 ## Recommended flow
 
@@ -206,7 +209,7 @@ The global `trcart` variable, declared in the header, receives the parsed metada
 | `rumble` | Indicates rumble presence. Motor control is not implemented yet. |
 | `sgb` | Super Game Boy compatibility byte. |
 | `gbc` | `0x80` for GB/GBC, `0xC0` for GBC-only, or `0` otherwise. |
-| `title[17]` | Title of up to 15 bytes for GBC cartridges or 16 bytes for older cartridges, always null-terminated. |
+| `title[17]` | Title from the inferred 11- or 15-byte CGB layout, or 16 bytes in older headers; always null-terminated. Four printable bytes at `0x013F`-`0x0142` identify the manufacturer-code layout and are excluded. |
 | `_romsize` | Raw ROM-size code. |
 | `_ramsize` | Raw RAM-size code. |
 | `cartridge_type` | Raw cartridge-type byte (`0x0147`). |
@@ -254,11 +257,12 @@ The parser buffer represents addresses `0x0100–0x014F`; therefore, the cartrid
 of bytes that reached the destination, including on a partial failure, and `0`
 when the operation is refused before any transfer starts.
 
-Every bulk routine re-reads the accessory status before each 32-byte block. That
-is what aborts a transfer as soon as the cartridge is pulled out, and what
-detects an accessory reset — after a reset the mapper is back at its power-on
-state, so the routine re-selects the bank (which also re-unlocks RAM) before
-trusting the window again.
+Every bulk routine reads the accessory status before and after each 32-byte data
+transaction. That aborts a transfer when the cartridge is pulled out and
+closes the race in which a reset happens immediately after the pre-flight
+check. After a reset the mapper is back at its power-on state, so the routine
+re-selects the bank (which also re-unlocks RAM) and repeats the same block
+before trusting the result.
 
 ### Power, access, and banking
 
@@ -354,8 +358,8 @@ The same formula places every MBC register the library writes:
 | Bit | Constant | Meaning |
 | --- | --- | --- |
 | `0x01` | `TRPAK_STATUS_READY` | Cartridge present and accessible. |
-| `0x04` | `TRPAK_STATUS_WAS_RESET` | A reset finished since the previous status read. Read-and-clear, so each read reports only new resets. |
-| `0x08` | `TRPAK_STATUS_IS_RESETTING` | A reset is still in progress; wait. |
+| `0x04` | `TRPAK_STATUS_IS_RESETTING` | A reset is still in progress; wait. |
+| `0x08` | `TRPAK_STATUS_WAS_RESET` | A reset finished since the previous status read. Read-and-clear, so each read reports only new resets. |
 | `0x40` | `TRPAK_STATUS_REMOVED` | No cartridge, or it was pulled out. |
 | `0x80` | `TRPAK_STATUS_POWERED` | Accessory power is on. |
 
@@ -394,6 +398,7 @@ number is the window slice itself, so only the two slices that name ROM count.
 | --- | --- | --- |
 | ROM without MBC | 2 | 1 |
 | MBC1 | 128 | 4 |
+| MBC1M | 64 | 1 |
 | MBC2 | 16 | 1 (internal) |
 | MBC3/MBC30 | 128 | 8 |
 | MBC5 | 512 | 16, or 8 with rumble |
@@ -411,7 +416,8 @@ have been pointed at Game Boy `0x8000` and beyond, which is not ROM.
 | Family | Status | Notes |
 | --- | --- | --- |
 | ROM without MBC | Implemented | Non-banked ROM and RAM are supported. |
-| MBC1 | Implemented | Full 128 banks (2 MiB). Banks `0x20`, `0x40`, and `0x60` are read through the fixed window in advanced banking mode, since the 5-bit register cannot select them. Multicart (MBC1M) wiring is not detected. |
+| MBC1 | Implemented | Full 128 banks (2 MiB). Banks `0x20`, `0x40`, and `0x60` are read through the fixed window in advanced banking mode, since the 5-bit register cannot select them. |
+| MBC1M | Implemented | One MiB compilation cartridges are detected by the repeated valid header/logo at bank `0x10`; the alternate four-bit layout exposes 64 ROM banks and one fixed RAM bank. |
 | MBC2 | Implemented | 512-byte internal RAM is normalized to the lower nibble. |
 | MMM01 | Detected, not implemented | Initialization returns an unsupported-cartridge error. |
 | MBC3/MBC30 | ROM/RAM implemented | MBC30 supports all eight banks of a 64 KiB save. RTC is not controlled yet. |
@@ -441,13 +447,17 @@ The tests compile `libtrpak.c` with `TRPAK_NO_DEFAULT_IO`, install a simulated b
 - DMA ROM dumping and verified save restoration;
 - interruption when a cartridge is removed;
 - recovery from an accessory reset in the middle of a dump, backup, or
-  restore, which clears the mapper's bank latch and re-locks cartridge RAM
+  restore, including a reset between the pre-flight status read and the data
+  transaction, which clears the mapper's bank latch and re-locks cartridge RAM
   while the status still reports a healthy cartridge;
 - alignment and bounds of 32-byte accesses;
 - explicit rejection of an unimplemented mapper;
 - a full 2 MiB dump against a mock that emulates the real MBC1 registers,
   covering banks `0x20`, `0x40`, and `0x60`, RAM banking, and the rejection of
   headers claiming more banks than MBC1 can address;
+- a byte-exact 1 MiB MBC1M dump, including automatic wiring detection and the
+  distinct banks above `0x0F`;
+- modern CGB title parsing without appending the four-byte manufacturer code;
 - decoding of the header edge cases: a RAM claim with a zero size code, MBC2's
   implicit RAM, and the detected-but-unsupported TAMA5 and HuC3 types;
 - refusal of every mapper's over-large bank count before any data moves, with
@@ -461,17 +471,15 @@ Host tests do not validate electrical timing, physical cartridge behavior, or th
 ## Limitations and next steps
 
 - Validate each mapper's command sequence on real hardware.
-- Detect MBC1 multicart (MBC1M) wiring, whose 4-bit bank register makes the
-  standard sequence produce a wrong dump.
 - Add automatic backup through a callback before restoration.
 - Add progress and cancellation callbacks.
 - Implement MBC3 RTC, MBC5 rumble, and Game Boy Camera registers.
 - Implement MMM01, HuC3, and TAMA5.
 - Recognize MBC6 (`0x20`) and MBC7 (`0x22`), which currently parse as unknown
   cartridge types.
-- Reduce the per-block readiness poll, which currently doubles the number of
-  Joybus transactions a dump costs. The poll is also what detects an accessory
-  reset, so any change has to keep that signal.
+- Reduce the two per-block readiness polls. They are what detect cartridge
+  removal and close the reset race, so any optimization has to preserve both
+  guarantees.
 - Gradually replace global `trcart` state with independent contexts.
 - Test backends for other flashcarts.
 - Add Nintendo 64 tests to a compatibility matrix.

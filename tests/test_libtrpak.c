@@ -317,6 +317,26 @@ static void test_header_parser(void)
         NULL, sizeof(header), &parsed) == TRPAK_ERR_INVALID_ARGUMENT);
     assert(trpak_parse_cartridge_header(
         header, sizeof(header), NULL) == TRPAK_ERR_INVALID_ARGUMENT);
+
+    /* Newer CGB headers use the last four pre-flag bytes for a manufacturer
+     * code; those bytes must not leak into the public title string. */
+    create_header(header, 0x1Bu, 0x05u, 0x03u);
+    memcpy(header + 0x34u, "MODERN GAME", 11u);
+    memcpy(header + 0x3Fu, "ABCD", 4u);
+    header[0x43u] = 0x80u;
+    finish_checksum(header);
+    assert(trpak_parse_cartridge_header(
+        header, sizeof(header), &parsed) == TRPAK_OK);
+    assert(strcmp(parsed.title, "MODERN GAME") == 0);
+
+    /* A zero-padded early CGB suffix stays part of the 15-byte title area. */
+    create_header(header, 0x1Bu, 0x05u, 0x03u);
+    memcpy(header + 0x34u, "EARLY CGB OLD", 13u);
+    header[0x43u] = 0x80u;
+    finish_checksum(header);
+    assert(trpak_parse_cartridge_header(
+        header, sizeof(header), &parsed) == TRPAK_OK);
+    assert(strcmp(parsed.title, "EARLY CGB OLD") == 0);
 }
 
 /**
@@ -391,6 +411,12 @@ static void test_configuration_validation(void)
     io.write_block = mock_write;
     assert(trpak_configure_io(&io, 4, MOCK_DMA_BASE) ==
         TRPAK_ERR_INVALID_ARGUMENT);
+
+    /* These values follow the Transfer Pak's booting and reset-detected bits,
+     * respectively. Keeping the assertions explicit prevents the two semantic
+     * names from being swapped again. */
+    assert(TRPAK_STATUS_IS_RESETTING == 0x04u);
+    assert(TRPAK_STATUS_WAS_RESET == 0x08u);
 }
 
 /**
@@ -498,8 +524,12 @@ typedef struct mock_mbc1 {
     uint8_t bank2;              /**< GB `0x4000`-`0x5FFF`, two bits. */
     uint8_t mode;               /**< GB `0x6000`-`0x7FFF`, banking mode. */
     bool ram_enabled;           /**< Set by writing `0x0A` to GB `0x0000`. */
+    bool multicart;             /**< Use alternate MBC1M register wiring. */
+    unsigned int boot_status_reads; /**< Status reads that report booting. */
     unsigned int blocks_to_reset; /**< Window reads left before a simulated
                                        reset fires; `0` disables it. */
+    unsigned int blocks_to_reset_before; /**< Reset before returning a read. */
+    unsigned int writes_to_reset_before; /**< Reset before accepting a write. */
     bool was_reset;             /**< Pending `TRPAK_STATUS_WAS_RESET` latch. */
     unsigned int resets;        /**< How many simulated resets have fired. */
 } mock_mbc1;
@@ -517,7 +547,21 @@ static uint8_t mbc1_status(const mock_mbc1 *state)
     if (state->was_reset) {
         status |= TRPAK_STATUS_WAS_RESET;
     }
+    if (state->boot_status_reads != 0u) {
+        status |= TRPAK_STATUS_IS_RESETTING;
+    }
     return status;
+}
+
+/** @brief Returns the mapper to its power-on state and raises the reset latch. */
+static void mbc1_force_reset(mock_mbc1 *state)
+{
+    state->bank1 = 0u;
+    state->bank2 = 0u;
+    state->mode = 0u;
+    state->ram_enabled = false;
+    state->was_reset = true;
+    state->resets++;
 }
 
 /**
@@ -536,12 +580,7 @@ static void mbc1_maybe_reset(mock_mbc1 *state)
     if (state->blocks_to_reset == 0u || --state->blocks_to_reset != 0u) {
         return;
     }
-    state->bank1 = 0u;
-    state->bank2 = 0u;
-    state->mode = 0u;
-    state->ram_enabled = false;
-    state->was_reset = true;
-    state->resets++;
+    mbc1_force_reset(state);
 }
 
 /**
@@ -568,10 +607,15 @@ static size_t mbc1_rom_offset(const mock_mbc1 *state, uint16_t gb)
     unsigned int bank;
 
     if (gb < 0x4000u) {
-        bank = state->mode != 0u ? (unsigned int)state->bank2 << 5 : 0u;
+        bank = state->mode != 0u
+            ? (unsigned int)state->bank2 << (state->multicart ? 4u : 5u)
+            : 0u;
     } else {
-        bank = ((unsigned int)state->bank2 << 5) |
-            (state->bank1 == 0u ? 1u : state->bank1);
+        unsigned int lower = state->bank1 == 0u
+            ? 1u
+            : state->bank1 & (state->multicart ? 0x0Fu : 0x1Fu);
+        bank = ((unsigned int)state->bank2 <<
+                (state->multicart ? 4u : 5u)) | lower;
     }
 
     return (size_t)bank * TRPAK_ROM_BANK_SIZE + (size_t)(gb & 0x3FFFu);
@@ -607,12 +651,19 @@ static int mbc1_read(
         data[0] = mbc1_status(state);
         /* Hardware clears the reset latch as a side effect of reading it. */
         state->was_reset = false;
+        if (state->boot_status_reads != 0u) {
+            state->boot_status_reads--;
+        }
         return 0;
     }
     if (address < 0xC000u) {
         return -1;
     }
 
+    if (state->blocks_to_reset_before != 0u &&
+        --state->blocks_to_reset_before == 0u) {
+        mbc1_force_reset(state);
+    }
     gb = mbc1_gb_address(state, address);
     if (gb < 0x8000u) {
         memcpy(data, state->rom + mbc1_rom_offset(state, gb),
@@ -662,6 +713,11 @@ static int mbc1_write(
         return -1;
     }
 
+    if (state->window == 0x02u && address >= 0xE000u &&
+        state->writes_to_reset_before != 0u &&
+        --state->writes_to_reset_before == 0u) {
+        mbc1_force_reset(state);
+    }
     gb = mbc1_gb_address(state, address);
     if (gb < 0x8000u) {
         /* Register writes move a whole 32-byte block. Modelling them by the
@@ -796,6 +852,50 @@ static void test_mbc1_large_rom(void)
 }
 
 /**
+ * @brief A 1 MiB MBC1M compilation cartridge uses bits 4-5, not 5-6.
+ *
+ * The ordinary MBC1 sequence maps bank 0 when it asks an MBC1M for bank 0x10,
+ * which lets initialization recognize the repeated header. The subsequent
+ * byte-exact dump proves that banks 0x10-0x3F use the alternate wiring rather
+ * than becoming duplicates of lower banks.
+ */
+static void test_mbc1_multicart(void)
+{
+    static uint8_t rom_copy[64u * TRPAK_ROM_BANK_SIZE];
+    size_t bytes_read = 0u;
+    size_t i;
+
+    memset(&mbc1, 0, sizeof(mbc1));
+    mbc1.multicart = true;
+    for (i = 0u; i < 64u * TRPAK_ROM_BANK_SIZE; i++) {
+        mbc1.rom[i] = (uint8_t)((i / TRPAK_ROM_BANK_SIZE) * 13u + i);
+    }
+    create_header(mbc1.rom + 0x100u, 0x01u, 0x05u, 0x00u);
+    configure_mbc1_mock();
+
+    assert(trpak_init() == TRPAK_OK);
+    assert(trpak_read_rom(rom_copy, sizeof(rom_copy), &bytes_read) == TRPAK_OK);
+    assert(bytes_read == sizeof(rom_copy));
+    assert(memcmp(rom_copy, mbc1.rom, sizeof(rom_copy)) == 0);
+    assert(memcmp(
+        rom_copy + 0x10u * TRPAK_ROM_BANK_SIZE,
+        mbc1.rom + 0x10u * TRPAK_ROM_BANK_SIZE,
+        TRPAK_ROM_BANK_SIZE) == 0);
+    assert(trpak_shutdown() == TRPAK_OK);
+
+    /* The same upper register selects a sub-game, not a RAM bank. An invalid
+     * 32 KiB RAM claim must therefore be rejected before any save data moves. */
+    create_header(mbc1.rom + 0x100u, 0x03u, 0x05u, 0x03u);
+    configure_mbc1_mock();
+    assert(trpak_init() == TRPAK_OK);
+    bytes_read = 123u;
+    assert(trpak_read_save(rom_copy, sizeof(rom_copy), &bytes_read) ==
+        TRPAK_ERR_UNSUPPORTED_CARTRIDGE);
+    assert(bytes_read == 0u);
+    assert(trpak_shutdown() == TRPAK_OK);
+}
+
+/**
  * @brief A reset in the middle of a transfer must not corrupt it silently.
  *
  * The accessory can reset while it is powered and a cartridge is inserted.
@@ -829,6 +929,7 @@ static void test_reset_during_transfer(void)
         mbc1.ram[i] = (uint8_t)(i * 11u + 3u);
     }
     create_header(mbc1.rom + 0x100u, 0x03u, 0x06u, 0x03u);
+    mbc1.boot_status_reads = 2u;
     configure_mbc1_mock();
     assert(trpak_init() == TRPAK_OK);
 
@@ -841,6 +942,14 @@ static void test_reset_during_transfer(void)
     assert(bytes_read == sizeof(mbc1.rom));
     assert(memcmp(rom_copy, mbc1.rom, sizeof(mbc1.rom)) == 0);
 
+    /* This reset fires after the pre-flight status read but before the ROM
+     * transaction returns. The affected block must be discarded and retried. */
+    mbc1.resets = 0u;
+    mbc1.blocks_to_reset_before = 5000u;
+    assert(trpak_read_rom(rom_copy, sizeof(rom_copy), &bytes_read) == TRPAK_OK);
+    assert(mbc1.resets == 1u);
+    assert(memcmp(rom_copy, mbc1.rom, sizeof(mbc1.rom)) == 0);
+
     /* Same for a backup, where the reset also re-locks RAM: every block after
      * it would otherwise read back as 0xFF. */
     mbc1.resets = 0u;
@@ -851,6 +960,13 @@ static void test_reset_during_transfer(void)
     assert(bytes_read == sizeof(mbc1.ram));
     assert(memcmp(save_copy, mbc1.ram, sizeof(mbc1.ram)) == 0);
 
+    mbc1.resets = 0u;
+    mbc1.blocks_to_reset_before = 100u;
+    assert(trpak_read_save(save_copy, sizeof(save_copy), &bytes_read) ==
+        TRPAK_OK);
+    assert(mbc1.resets == 1u);
+    assert(memcmp(save_copy, mbc1.ram, sizeof(mbc1.ram)) == 0);
+
     /* And for a restore. Verification is on, so a write silently swallowed by
      * re-locked RAM would surface as TRPAK_ERR_VERIFY_FAILED. */
     for (i = 0u; i < sizeof(restored); i++) {
@@ -859,6 +975,17 @@ static void test_reset_during_transfer(void)
     mbc1.resets = 0u;
     mbc1.blocks_to_reset = 100u;
     assert(trpak_write_save(restored, sizeof(restored), true) == TRPAK_OK);
+    assert(mbc1.resets == 1u);
+    assert(memcmp(mbc1.ram, restored, sizeof(restored)) == 0);
+
+    /* Without verification, a reset immediately before the data write used to
+     * drop exactly one block while the operation still returned success. */
+    for (i = 0u; i < sizeof(restored); i++) {
+        restored[i] = (uint8_t)(i * 9u + 0x21u);
+    }
+    mbc1.resets = 0u;
+    mbc1.writes_to_reset_before = 100u;
+    assert(trpak_write_save(restored, sizeof(restored), false) == TRPAK_OK);
     assert(mbc1.resets == 1u);
     assert(memcmp(mbc1.ram, restored, sizeof(restored)) == 0);
 
@@ -1017,6 +1144,7 @@ int main(void)
     test_configuration_validation();
     test_lifecycle_buffers_and_dma();
     test_mbc1_large_rom();
+    test_mbc1_multicart();
     test_reset_during_transfer();
     test_ram_stays_locked_on_rejected_bank();
     test_mapper_bank_limits();

@@ -20,14 +20,27 @@ renaming `Unreleased` to that version.
   header is now refused with `TRPAK_ERR_UNSUPPORTED_CARTRIDGE`.
 
 - **An accessory reset mid-transfer corrupted the result without reporting it.**
-  `TRPAK_STATUS_WAS_RESET` was declared and documented in the public header but
-  never consulted. A reset leaves the accessory powered, present, and ready, so
-  nothing else in the status distinguishes it, while the mapper returns to its
-  power-on state: the selected bank is gone and cartridge RAM re-locks. Dumps
-  recorded the mapper's default bank as if it were the one requested, backups
-  read the floating bus, and restores were dropped by the re-locked RAM while
-  still reporting success. All three bulk paths now detect the reset and
-  re-select the bank — which also re-unlocks RAM — before continuing.
+  The public constants for reset-in-progress (`0x04`) and reset-detected
+  (`0x08`) were swapped, and the latter was not consulted. In addition, checking
+  status only before a block left a race in which the reset could happen before
+  the data transaction. A reset leaves the accessory powered, present, and
+  ready, while the mapper returns to its power-on state: the selected bank is
+  gone and cartridge RAM re-locks. All bulk paths now poll through booting,
+  check status on both sides of each transaction, restore mapper state, and
+  retry the affected block. Repeated resets are bounded by a timeout.
+
+- **MBC1M multicarts were dumped with conventional MBC1 wiring.** Their main
+  bank register has four effective bits and the upper register supplies bits
+  4-5, so banks above `0x0F` became duplicates of lower content. One MiB MBC1
+  cartridges are now probed for the repeated valid header/logo at bank `0x10`,
+  then traversed with the 64-bank MBC1M layout. Their RAM is limited to the one
+  fixed bank the wiring can expose.
+
+- **Modern CGB titles included the manufacturer code.** Headers with the
+  four-byte field at `0x013F`-`0x0142` now expose only the 11-byte title through
+  `trpak_cart.title`. Since the header has no layout-version marker, four
+  printable bytes identify the newer form; zero-padded early CGB and legacy
+  16-byte layouts retain their longer interpretation.
 
 - **Bank counts beyond the mapper's reach aborted mid-transfer.** Only MBC1
   (above 128 banks) and HuC1 (above 64) were checked. MBC2 above 16 ROM banks,
@@ -82,9 +95,10 @@ renaming `Unreleased` to that version.
 
 - Regression tests for every fix above: header edge cases (RAM claim with a
   zero size code, MBC2's implicit RAM, TAMA5 and HuC3), recovery from a reset
-  during a dump, a backup, and a restore, refusal of over-large bank counts
-  with `bytes_read` at zero, and the RAM-stays-locked guarantee. Each was
-  confirmed to fail against the pre-fix library.
+  during a dump, a backup, and a restore (including the pre-flight race), a
+  byte-exact MBC1M dump, modern CGB title decoding, refusal of over-large bank
+  counts with `bytes_read` at zero, and the RAM-stays-locked guarantee. Each
+  was confirmed to fail against the pre-fix library.
 
 - The MBC1 test mock can now simulate a Transfer Pak reset: it clears the bank
   registers, the banking mode, and the RAM-enable latch, then reports
