@@ -320,6 +320,59 @@ static void test_header_parser(void)
 }
 
 /**
+ * @brief Header decoding of the cases that used to be rejected outright.
+ *
+ * Three separate rules, none of which needs an accessory:
+ *
+ * - a type byte claiming RAM alongside a `0` size code decodes as RAM-less
+ *   rather than failing, so such a cartridge stays dumpable;
+ * - MBC2 ignores the size code entirely, since its RAM is part of the mapper;
+ * - TAMA5 and HuC3 are decoded so a caller can report what is inserted, even
+ *   though neither has a banking path.
+ */
+static void test_header_edge_cases(void)
+{
+    uint8_t header[TRPAK_HEADER_SIZE];
+    trpak_cart parsed;
+
+    create_header(header, 0x03u, 0x04u, 0x00u); /* MBC1 + RAM + BATTERY */
+    assert(trpak_parse_cartridge_header(
+        header, sizeof(header), &parsed) == TRPAK_OK);
+    assert(parsed.mapper == TRPAK_MAPPER_MBC1);
+    assert(parsed.ram == 0u);
+    assert(parsed.rambanks == 0u);
+    assert(parsed.ramsize == 0u);
+    /* The type byte's claim stays visible even though the size code won. */
+    assert(parsed.battery != 0u);
+    assert(parsed.romsize == 512u * 1024u);
+
+    create_header(header, 0x06u, 0x03u, 0x00u); /* MBC2 + BATTERY */
+    assert(trpak_parse_cartridge_header(
+        header, sizeof(header), &parsed) == TRPAK_OK);
+    assert(parsed.mapper == TRPAK_MAPPER_MBC2);
+    assert(parsed.ram != 0u);
+    assert(parsed.ramsize == 512u);
+
+    create_header(header, 0xFDu, 0x03u, 0x00u); /* BANDAI TAMA5 */
+    assert(trpak_parse_cartridge_header(
+        header, sizeof(header), &parsed) == TRPAK_OK);
+    assert(parsed.mapper == TRPAK_MAPPER_TAMA5);
+    assert(!trpak_mapper_is_supported(parsed.mapper));
+
+    create_header(header, 0xFEu, 0x05u, 0x03u); /* HuC3 */
+    assert(trpak_parse_cartridge_header(
+        header, sizeof(header), &parsed) == TRPAK_OK);
+    assert(parsed.mapper == TRPAK_MAPPER_HUC3);
+    assert(parsed.rtc != 0u);
+    assert(!trpak_mapper_is_supported(parsed.mapper));
+
+    /* A genuinely unknown type byte is still refused. */
+    create_header(header, 0x22u, 0x05u, 0x00u); /* MBC7 */
+    assert(trpak_parse_cartridge_header(
+        header, sizeof(header), &parsed) == TRPAK_ERR_UNSUPPORTED_CARTRIDGE);
+}
+
+/**
  * @brief trpak_configure_io() rejects incomplete backends and bad ports.
  *
  * Covers the three failure modes: no structure at all, a structure missing the
@@ -445,11 +498,15 @@ typedef struct mock_mbc1 {
     uint8_t bank2;              /**< GB `0x4000`-`0x5FFF`, two bits. */
     uint8_t mode;               /**< GB `0x6000`-`0x7FFF`, banking mode. */
     bool ram_enabled;           /**< Set by writing `0x0A` to GB `0x0000`. */
+    unsigned int blocks_to_reset; /**< Window reads left before a simulated
+                                       reset fires; `0` disables it. */
+    bool was_reset;             /**< Pending `TRPAK_STATUS_WAS_RESET` latch. */
+    unsigned int resets;        /**< How many simulated resets have fired. */
 } mock_mbc1;
 
 static mock_mbc1 mbc1;
 
-/** @brief Status byte, same rules as mock_status(). */
+/** @brief Status byte, same rules as mock_status() plus the reset latch. */
 static uint8_t mbc1_status(const mock_mbc1 *state)
 {
     uint8_t status = state->power == 0x84u ? TRPAK_STATUS_POWERED : 0u;
@@ -457,7 +514,34 @@ static uint8_t mbc1_status(const mock_mbc1 *state)
     if (state->access != 0u && state->power == 0x84u) {
         status |= TRPAK_STATUS_READY;
     }
+    if (state->was_reset) {
+        status |= TRPAK_STATUS_WAS_RESET;
+    }
     return status;
+}
+
+/**
+ * @brief Fires a simulated Transfer Pak reset once the countdown expires.
+ *
+ * A reset returns the mapper to its power-on state: the bank registers and the
+ * banking mode go back to zero and cartridge RAM re-locks. The accessory stays
+ * powered, present, and ready, so nothing but ::TRPAK_STATUS_WAS_RESET tells
+ * the library that the bank it selected is no longer latched — which is
+ * exactly the condition being tested.
+ *
+ * @param state Mock to disturb.
+ */
+static void mbc1_maybe_reset(mock_mbc1 *state)
+{
+    if (state->blocks_to_reset == 0u || --state->blocks_to_reset != 0u) {
+        return;
+    }
+    state->bank1 = 0u;
+    state->bank2 = 0u;
+    state->mode = 0u;
+    state->ram_enabled = false;
+    state->was_reset = true;
+    state->resets++;
 }
 
 /**
@@ -521,6 +605,8 @@ static int mbc1_read(
     }
     if (address == 0xB000u) {
         data[0] = mbc1_status(state);
+        /* Hardware clears the reset latch as a side effect of reading it. */
+        state->was_reset = false;
         return 0;
     }
     if (address < 0xC000u) {
@@ -531,6 +617,7 @@ static int mbc1_read(
     if (gb < 0x8000u) {
         memcpy(data, state->rom + mbc1_rom_offset(state, gb),
             TRPAK_TRANSFER_BLOCK_SIZE);
+        mbc1_maybe_reset(state);
         return 0;
     }
     if (gb >= 0xA000u && gb < 0xC000u) {
@@ -541,6 +628,7 @@ static int mbc1_read(
         }
         memcpy(data, state->ram + mbc1_ram_offset(state, gb),
             TRPAK_TRANSFER_BLOCK_SIZE);
+        mbc1_maybe_reset(state);
         return 0;
     }
     return -1;
@@ -708,6 +796,188 @@ static void test_mbc1_large_rom(void)
 }
 
 /**
+ * @brief A reset in the middle of a transfer must not corrupt it silently.
+ *
+ * The accessory can reset while it is powered and a cartridge is inserted.
+ * When that happens the mapper returns to its power-on state — bank registers
+ * cleared, banking mode back to simple, cartridge RAM re-locked — while the
+ * status keeps reporting powered, present, and ready. Only
+ * ::TRPAK_STATUS_WAS_RESET distinguishes it, and it is a read-and-clear latch.
+ *
+ * Left unhandled, that is a silent-corruption bug rather than a failure: the
+ * rest of the bank is served from whichever bank the mapper defaults to, and
+ * the dump stores those bytes as if they were the ones asked for. On the save
+ * paths it is worse — a backup reads the floating bus, and a restore is
+ * dropped by the re-locked RAM while still reporting success.
+ *
+ * Each case below fires one reset mid-transfer and demands byte-exact data
+ * anyway, which is only possible if the bank was re-selected in response.
+ */
+static void test_reset_during_transfer(void)
+{
+    static uint8_t rom_copy[MBC1_ROM_SIZE];
+    static uint8_t save_copy[MBC1_RAM_SIZE];
+    static uint8_t restored[MBC1_RAM_SIZE];
+    size_t bytes_read = 0u;
+    size_t i;
+
+    memset(&mbc1, 0, sizeof(mbc1));
+    for (i = 0u; i < sizeof(mbc1.rom); i++) {
+        mbc1.rom[i] = (uint8_t)((i / TRPAK_ROM_BANK_SIZE) ^ (i * 31u));
+    }
+    for (i = 0u; i < sizeof(mbc1.ram); i++) {
+        mbc1.ram[i] = (uint8_t)(i * 11u + 3u);
+    }
+    create_header(mbc1.rom + 0x100u, 0x03u, 0x06u, 0x03u);
+    configure_mbc1_mock();
+    assert(trpak_init() == TRPAK_OK);
+
+    /* A bank is 512 blocks, so this lands deep inside bank 9 — far enough in
+     * that an unrecovered reset would corrupt the rest of that bank and be
+     * impossible to miss in the comparison. */
+    mbc1.blocks_to_reset = 5000u;
+    assert(trpak_read_rom(rom_copy, sizeof(rom_copy), &bytes_read) == TRPAK_OK);
+    assert(mbc1.resets == 1u);
+    assert(bytes_read == sizeof(mbc1.rom));
+    assert(memcmp(rom_copy, mbc1.rom, sizeof(mbc1.rom)) == 0);
+
+    /* Same for a backup, where the reset also re-locks RAM: every block after
+     * it would otherwise read back as 0xFF. */
+    mbc1.resets = 0u;
+    mbc1.blocks_to_reset = 100u;
+    assert(trpak_read_save(save_copy, sizeof(save_copy), &bytes_read) ==
+        TRPAK_OK);
+    assert(mbc1.resets == 1u);
+    assert(bytes_read == sizeof(mbc1.ram));
+    assert(memcmp(save_copy, mbc1.ram, sizeof(mbc1.ram)) == 0);
+
+    /* And for a restore. Verification is on, so a write silently swallowed by
+     * re-locked RAM would surface as TRPAK_ERR_VERIFY_FAILED. */
+    for (i = 0u; i < sizeof(restored); i++) {
+        restored[i] = (uint8_t)(i * 5u + 0x40u);
+    }
+    mbc1.resets = 0u;
+    mbc1.blocks_to_reset = 100u;
+    assert(trpak_write_save(restored, sizeof(restored), true) == TRPAK_OK);
+    assert(mbc1.resets == 1u);
+    assert(memcmp(mbc1.ram, restored, sizeof(restored)) == 0);
+
+    mbc1.blocks_to_reset = 0u;
+    assert(trpak_shutdown() == TRPAK_OK);
+}
+
+/**
+ * @brief A rejected RAM bank must not leave cartridge RAM unlocked.
+ *
+ * Runs against the MBC1 mock the previous test installed, but describes other
+ * cartridges in ::trcart. Those are the shapes that matter here: MBC3 and
+ * rumble MBC5 both stop at eight RAM banks for reasons outside the register's
+ * width — higher values select the RTC on one and drive the motor on the
+ * other — so a header can legitimately declare a bank that the mapper must
+ * still refuse. MBC1 and HuC1 cannot show the bug, as their limit is the
+ * register width itself and was always checked early.
+ *
+ * The mock decodes the RAM-enable write at Game Boy `0x0000` regardless of
+ * mapper, so mock_mbc1::ram_enabled records whether the unlock happened before
+ * the rejection.
+ */
+static void test_ram_stays_locked_on_rejected_bank(void)
+{
+    assert(!mbc1.ram_enabled);
+
+    memset(&trcart, 0, sizeof(trcart));
+    trcart.ram = 1u;
+    trcart.rambanks = 16u;
+    trcart.ramsize = 16u * TRPAK_RAM_BANK_SIZE;
+
+    trcart.mapper = TRPAK_MAPPER_MBC5;
+    trcart.rumble = 1u;
+    assert(trpak_select_ram_bank(8u) == TRPAK_ERR_INVALID_BANK);
+    assert(!mbc1.ram_enabled);
+
+    trcart.mapper = TRPAK_MAPPER_MBC3;
+    trcart.rumble = 0u;
+    assert(trpak_select_ram_bank(8u) == TRPAK_ERR_INVALID_BANK);
+    assert(!mbc1.ram_enabled);
+
+    /* A bank the mapper can reach still unlocks RAM, so the check above is
+     * not simply refusing everything. */
+    assert(trpak_select_ram_bank(7u) == TRPAK_OK);
+    assert(mbc1.ram_enabled);
+    assert(trpak_disable_ram() == TRPAK_OK);
+    assert(!mbc1.ram_enabled);
+}
+
+/**
+ * @brief Headers claiming more banks than the mapper can select are refused
+ *        before any data moves.
+ *
+ * These guards all run ahead of the first accessory access, so ::trcart is
+ * driven directly and no mock traffic is involved. The DMA entry points are
+ * used because they skip the buffer-capacity check, which would otherwise
+ * reject the call first and hide the limit being tested.
+ *
+ * `bytes_read` is pre-set to a sentinel every time: the documented contract is
+ * that it always reflects what was copied, so a refusal must leave `0` behind
+ * rather than the caller's previous value.
+ */
+static void test_mapper_bank_limits(void)
+{
+    size_t bytes_read;
+
+    /* Mapper-less cartridge. trpak_select_rom_bank() writes the bank number
+     * straight into the window's slice register there, so a header claiming
+     * more than two banks would have pointed the window at Game Boy 0x8000 —
+     * which is not ROM — and reported success over the resulting garbage. */
+    memset(&trcart, 0, sizeof(trcart));
+    trcart.mapper = TRPAK_MAPPER_NONE;
+    trcart.rombanks = 8u;
+    trcart.romsize = 8u * TRPAK_ROM_BANK_SIZE;
+    bytes_read = 0xABCDu;
+    assert(trpak_read_rom_dma(&bytes_read) == TRPAK_ERR_UNSUPPORTED_CARTRIDGE);
+    assert(bytes_read == 0u);
+
+    /* MBC2's bank register is four bits wide. */
+    memset(&trcart, 0, sizeof(trcart));
+    trcart.mapper = TRPAK_MAPPER_MBC2;
+    trcart.rombanks = 512u;
+    trcart.romsize = 512u * TRPAK_ROM_BANK_SIZE;
+    bytes_read = 0xABCDu;
+    assert(trpak_read_rom_dma(&bytes_read) == TRPAK_ERR_UNSUPPORTED_CARTRIDGE);
+    assert(bytes_read == 0u);
+
+    /* The Camera mapper's is six bits wide. */
+    memset(&trcart, 0, sizeof(trcart));
+    trcart.mapper = TRPAK_MAPPER_CAMERA;
+    trcart.rombanks = 128u;
+    trcart.romsize = 128u * TRPAK_ROM_BANK_SIZE;
+    bytes_read = 0xABCDu;
+    assert(trpak_read_rom_dma(&bytes_read) == TRPAK_ERR_UNSUPPORTED_CARTRIDGE);
+    assert(bytes_read == 0u);
+
+    /* Rumble MBC5: bit 3 of the RAM bank register drives the motor, so only
+     * eight of the sixteen banks this header claims are reachable. Both save
+     * directions must refuse rather than transfer half the file. */
+    memset(&trcart, 0, sizeof(trcart));
+    trcart.mapper = TRPAK_MAPPER_MBC5;
+    trcart.rumble = 1u;
+    trcart.ram = 1u;
+    trcart.rambanks = 16u;
+    trcart.ramsize = 16u * TRPAK_RAM_BANK_SIZE;
+    bytes_read = 0xABCDu;
+    assert(trpak_read_save_dma(&bytes_read) == TRPAK_ERR_UNSUPPORTED_CARTRIDGE);
+    assert(bytes_read == 0u);
+    assert(trpak_write_save_dma(false) == TRPAK_ERR_UNSUPPORTED_CARTRIDGE);
+
+    /* And a cartridge with no RAM at all still reports that, with a defined
+     * byte count. */
+    memset(&trcart, 0, sizeof(trcart));
+    bytes_read = 0xABCDu;
+    assert(trpak_read_save_dma(&bytes_read) == TRPAK_ERR_NO_RAM);
+    assert(bytes_read == 0u);
+}
+
+/**
  * @brief Argument checking in the low-level accessors.
  *
  * Covers a misaligned ROM address, one past the last full block, a RAM address
@@ -733,17 +1003,23 @@ static void test_api_boundaries(void)
 /**
  * @brief Runs the suite; any failed assertion aborts the process.
  *
- * The order matters only in that test_api_boundaries() runs after the
- * lifecycle test, reusing the backend it configured.
+ * The order matters in two places: test_api_boundaries() runs after the
+ * lifecycle test, reusing the backend it configured, and the last two tests
+ * overwrite ::trcart, so nothing after them may depend on the cartridge the
+ * earlier tests set up.
  *
  * @return `0` when every assertion held.
  */
 int main(void)
 {
     test_header_parser();
+    test_header_edge_cases();
     test_configuration_validation();
     test_lifecycle_buffers_and_dma();
     test_mbc1_large_rom();
+    test_reset_during_transfer();
+    test_ram_stays_locked_on_rejected_bank();
+    test_mapper_bank_limits();
     test_api_boundaries();
     puts("libtrpak tests: OK");
     return 0;

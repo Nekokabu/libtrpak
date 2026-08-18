@@ -29,16 +29,19 @@
  * `slice * 0x4000 + (tp_address - 0xC000)`. That single formula explains every
  * magic address below:
  *
- * | Slice | Transfer Pak address | Game Boy address | Register hit          |
- * | ----- | -------------------- | ---------------- | --------------------- |
- * | `0`   | `0xC000`             | `0x0000`         | RAM enable            |
- * | `0`   | `0xE000`             | `0x2000`         | ROM bank (MBC5 low 8) |
- * | `0`   | `0xE100`             | `0x2100`         | ROM bank (MBC2 needs bit 8 of the address set) |
- * | `0`   | `0xF000`             | `0x3000`         | ROM bank bit 8 (MBC5) |
- * | `1`   | `0xC000`             | `0x4000`         | RAM bank / upper ROM bits |
- * | `1`   | `0xE000`             | `0x6000`         | MBC1 banking mode     |
- * | `1`   | `0xE016`             | `0x6016`         | MBC1 banking mode     |
- * | `2`   | `0xE000`-`0xFFFF`    | `0xA000`-`0xBFFF`| Cartridge save RAM    |
+ * | Slice | Transfer Pak address | Game Boy address | Constant                |
+ * | ----- | -------------------- | ---------------- | ----------------------- |
+ * | `0`   | `0xC000`             | `0x0000`         | ::TP_REG_RAM_ENABLE     |
+ * | `0`   | `0xE000`             | `0x2000`         | ::TP_REG_ROM_BANK       |
+ * | `0`   | `0xE100`             | `0x2100`         | ::TP_REG_ROM_BANK_ALT   |
+ * | `0`   | `0xF000`             | `0x3000`         | ::TP_REG_ROM_BANK_HIGH  |
+ * | `1`   | `0xC000`             | `0x4000`         | ::TP_REG_RAM_BANK       |
+ * | `1`   | `0xE000`             | `0x6000`         | ::TP_REG_MBC1_MODE      |
+ * | `2`   | `0xE000`-`0xFFFF`    | `0xA000`-`0xBFFF`| Cartridge save RAM      |
+ *
+ * The window slice is never written directly either: select_window_slice()
+ * owns the bank register at `0xA000`, so each poke above reads as a slice
+ * followed by the constant naming the register that slice exposes.
  *
  * @section impl_state State
  *
@@ -71,6 +74,30 @@
 #define TP_RAM_WINDOW_START    0xE000u
 /** Address of the last complete 32-byte block in the window. */
 #define TP_WINDOW_END          0xFFE0u
+
+/*
+ * MBC register addresses inside the data window.
+ *
+ * Each of these is a Transfer Pak address, and each is only meaningful once
+ * the slice named in its comment has been selected with
+ * select_window_slice(): the Game Boy address the cartridge actually sees is
+ * `slice * 0x4000 + (address - 0xC000)`. That is why two of them share the
+ * value 0xC000 — the same window address reaches a different Game Boy
+ * register depending on the slice underneath it.
+ */
+/** Slice 0 -> GB 0x0000: RAM enable (`0x0A` unlocks, anything else locks). */
+#define TP_REG_RAM_ENABLE      0xC000u
+/** Slice 0 -> GB 0x2000: ROM bank register (MBC5 low 8 bits, HuC1 six bits). */
+#define TP_REG_ROM_BANK        0xE000u
+/** Slice 0 -> GB 0x2100: same register, with address bit 8 set for MBC2. */
+#define TP_REG_ROM_BANK_ALT    0xE100u
+/** Slice 0 -> GB 0x3000: ROM bank bit 8 (MBC5 only). */
+#define TP_REG_ROM_BANK_HIGH   0xF000u
+/** Slice 1 -> GB 0x4000: RAM bank, or the upper ROM bank bits on MBC1. */
+#define TP_REG_RAM_BANK        0xC000u
+/** Slice 1 -> GB 0x6000: MBC1 banking mode select. */
+#define TP_REG_MBC1_MODE       0xE000u
+
 /** Readiness poll budget; with the delay below this is a 500 ms timeout. */
 #define TP_READY_POLL_ATTEMPTS 50u
 /** Pause between readiness polls, in milliseconds. */
@@ -89,11 +116,12 @@ typedef struct trpak_runtime {
 /** Single global runtime; zero-initialized, so `configured` starts false. */
 static trpak_runtime runtime;
 
-/** Scratch block reused by trpak_init() while assembling the header. */
-static uint8_t transfer_data[TRPAK_TRANSFER_BLOCK_SIZE];
-
 /** Metadata of the cartridge described by the last successful trpak_init(). */
 trpak_cart trcart;
+
+/* ------------------------------------------------------------------------ */
+/* 1. Default backend: libdragon Joybus and EverDrive 64 DMA                 */
+/* ------------------------------------------------------------------------ */
 
 #ifndef TRPAK_NO_DEFAULT_IO
 /**
@@ -178,6 +206,10 @@ static int platform_dma_load(
 }
 #endif
 #endif
+
+/* ------------------------------------------------------------------------ */
+/* 2. Backend configuration and transport                                    */
+/* ------------------------------------------------------------------------ */
 
 /**
  * @copydoc trpak_use_default_io
@@ -311,6 +343,27 @@ static int write_filled(uint16_t address, uint8_t value)
 }
 
 /**
+ * @brief Points the 16 KiB data window at one Game Boy slice.
+ *
+ * A named wrapper over the bank register at ::TP_REGISTER_ADDRESS. Every MBC
+ * sequence in this file is a chain of "select a slice, poke a register" steps,
+ * so spelling the slice out at the call site is what makes the Game Boy
+ * address each poke reaches readable.
+ *
+ * @param slice `0` for GB `0x0000`-`0x3FFF`, `1` for `0x4000`-`0x7FFF`,
+ *              `2` for `0x8000`-`0xBFFF`.
+ * @return ::TRPAK_OK or ::TRPAK_ERR_IO.
+ */
+static int select_window_slice(uint8_t slice)
+{
+    return write_filled(TP_REGISTER_ADDRESS, slice);
+}
+
+/* ------------------------------------------------------------------------ */
+/* 3. Power, access mode, and status polling                                 */
+/* ------------------------------------------------------------------------ */
+
+/**
  * @copydoc trpak_set_power
  *
  * `0x84` is the documented enable pattern; `0xFE` is simply a value that is
@@ -428,19 +481,34 @@ int trpak_get_access_state(int *state)
  * or restore abort as soon as the cartridge is pulled out instead of writing
  * garbage.
  *
+ * A reset that already finished is reported separately through `was_reset`
+ * rather than as an error. The accessory is perfectly usable afterwards, but
+ * the mapper is back at its power-on state, so whatever bank the caller
+ * latched is gone and cartridge RAM has re-locked itself. Only a caller that
+ * holds such a latch — the bulk loops, mid-bank — needs to know.
+ *
+ * ::TRPAK_STATUS_WAS_RESET is a read-and-clear latch on real hardware, so each
+ * status read reports the resets that happened since the previous one.
+ *
+ * @param was_reset Optional; receives `true` when the accessory reset since
+ *                  the last status read. Pass NULL to ignore the latch, which
+ *                  also consumes it.
  * @retval TRPAK_OK               Powered, present, ready, not resetting.
  * @retval TRPAK_ERR_NO_CARTRIDGE Removal bit set.
  * @retval TRPAK_ERR_POWER_OFF    Power bit cleared.
  * @retval TRPAK_ERR_ACCESS_STATE Not ready yet, or a reset is in progress.
  * @retval TRPAK_ERR_IO           Status read failed.
  */
-static int check_cartridge_ready(void)
+static int check_cartridge_ready(bool *was_reset)
 {
     uint8_t status;
     int result = trpak_get_status(&status);
 
     if (result != TRPAK_OK) {
         return result;
+    }
+    if (was_reset != NULL) {
+        *was_reset = (status & TRPAK_STATUS_WAS_RESET) != 0u;
     }
     if ((status & TRPAK_STATUS_REMOVED) != 0u) {
         return TRPAK_ERR_NO_CARTRIDGE;
@@ -474,7 +542,9 @@ static int wait_for_cartridge_ready(void)
     int result;
 
     for (attempt = 0u; attempt < TP_READY_POLL_ATTEMPTS; attempt++) {
-        result = check_cartridge_ready();
+        /* The reset latch is irrelevant here: nothing is banked yet, and
+         * powering up sets it by definition. */
+        result = check_cartridge_ready(NULL);
         if (result == TRPAK_OK || result == TRPAK_ERR_NO_CARTRIDGE ||
             result == TRPAK_ERR_IO) {
             return result;
@@ -486,6 +556,10 @@ static int wait_for_cartridge_ready(void)
 
     return TRPAK_ERR_TRANSFER_TIMEOUT;
 }
+
+/* ------------------------------------------------------------------------ */
+/* 4. Header decoding (pure, hardware-free)                                  */
+/* ------------------------------------------------------------------------ */
 
 /**
  * @brief Translates the ROM size code at Game Boy `0x0148` into a bank count.
@@ -655,6 +729,17 @@ static int decode_cartridge_type(uint8_t type, trpak_cart *out)
         out->ram = true;
         out->battery = true;
         break;
+    case 0xFDu: /* BANDAI TAMA5 */
+        out->mapper = TRPAK_MAPPER_TAMA5;
+        out->ram = true;
+        out->battery = true;
+        break;
+    case 0xFEu: /* HuC3 */
+        out->mapper = TRPAK_MAPPER_HUC3;
+        out->ram = true;
+        out->battery = true;
+        out->rtc = true;
+        break;
     case 0xFFu: /* HuC1 + RAM + BATTERY */
         out->mapper = TRPAK_MAPPER_HUC1;
         out->ram = true;
@@ -697,6 +782,16 @@ static int decode_ram_size(trpak_cart *out)
     }
 
     switch (out->_ramsize) {
+    case 0x00u:
+        /* Some cartridges set a RAM bit in the type byte yet declare no RAM
+         * size. There is no save to back up either way, and rejecting the
+         * header would also make the ROM undumpable, so downgrade the
+         * cartridge to RAM-less instead of failing the whole parse. The
+         * battery flag is left alone as a hint that the type byte disagreed. */
+        out->ram = 0u;
+        out->rambanks = 0u;
+        out->ramsize = 0u;
+        break;
     case 0x01u: /* 2 KiB: a partially populated single bank. */
         out->rambanks = 1u;
         out->ramsize = 2u * 1024u;
@@ -803,6 +898,10 @@ int trpak_parse_cartridge_header(
     return decode_ram_size(out);
 }
 
+/* ------------------------------------------------------------------------ */
+/* 5. Mapper capabilities and banking                                        */
+/* ------------------------------------------------------------------------ */
+
 /** @copydoc trpak_mapper_is_supported */
 bool trpak_mapper_is_supported(uint8_t mapper)
 {
@@ -822,6 +921,86 @@ bool trpak_mapper_is_supported(uint8_t mapper)
 }
 
 /**
+ * @brief Highest ROM bank index the mapper's registers can actually select.
+ *
+ * Single source of truth for the ROM banking limits. It is consulted both when
+ * one bank is selected and, through bank_count_fits_mapper(), before a dump
+ * starts, so a cartridge is refused up front instead of failing halfway
+ * through with a partial image.
+ *
+ * A mapper-less cartridge is the odd one out: trpak_select_rom_bank() writes
+ * the bank number straight into the window's slice register there, so only
+ * banks 0 and 1 — slices 0 and 1 — name real ROM. Slice 2 and above point at
+ * Game Boy `0x8000` and beyond, which is not ROM at all.
+ *
+ * @param mapper One of the `TRPAK_MAPPER_*` identifiers.
+ * @return Highest selectable bank index, or `0` for mappers with no
+ *         implemented banking path.
+ */
+static uint16_t mapper_max_rom_bank(uint8_t mapper)
+{
+    switch (mapper) {
+    case TRPAK_MAPPER_NONE:   return 0x001u; /* Window slices 0 and 1.   */
+    case TRPAK_MAPPER_MBC1:   return 0x07Fu; /* BANK2:BANK1, 2+5 bits.   */
+    case TRPAK_MAPPER_MBC2:   return 0x00Fu; /* Four bits.               */
+    case TRPAK_MAPPER_MBC3:   return 0x07Fu; /* Seven bits.              */
+    case TRPAK_MAPPER_MBC5:   return 0x1FFu; /* Nine bits over two regs. */
+    case TRPAK_MAPPER_CAMERA: return 0x03Fu; /* Six bits.                */
+    case TRPAK_MAPPER_HUC1:   return 0x03Fu; /* Six bits.                */
+    default:                  return 0u;
+    }
+}
+
+/**
+ * @brief Highest RAM bank index the mapper's registers can safely select.
+ *
+ * Counterpart of mapper_max_rom_bank(). Two limits are narrower than the
+ * register itself: MBC3 stops at 7 because higher values address the RTC
+ * registers rather than RAM, and a rumble MBC5 stops at 7 because the next bit
+ * of the same register drives the motor.
+ *
+ * @param mapper One of the `TRPAK_MAPPER_*` identifiers.
+ * @param rumble Non-zero for an MBC5 cartridge with a rumble motor.
+ * @return Highest selectable bank index, or `0` when the mapper has a single
+ *         implicit bank or no implemented banking path.
+ */
+static uint16_t mapper_max_ram_bank(uint8_t mapper, bool rumble)
+{
+    switch (mapper) {
+    case TRPAK_MAPPER_NONE:   return 0x0u; /* Unbanked.                  */
+    case TRPAK_MAPPER_MBC1:   return 0x3u; /* Two bits.                  */
+    case TRPAK_MAPPER_MBC2:   return 0x0u; /* One internal bank.         */
+    case TRPAK_MAPPER_MBC3:   return 0x7u; /* Above 7 selects the RTC.   */
+    case TRPAK_MAPPER_MBC5:   return rumble ? 0x7u : 0xFu;
+    case TRPAK_MAPPER_CAMERA: return 0xFu; /* Four bits.                 */
+    case TRPAK_MAPPER_HUC1:   return 0x3u; /* Two bits.                  */
+    default:                  return 0u;
+    }
+}
+
+/**
+ * @brief Rejects a header that declares more banks than the mapper can reach.
+ *
+ * Called before every bulk operation. Without it a cartridge whose header
+ * over-states its size is traversed until the first unreachable bank, leaving
+ * the caller with a partial image and a confusing ::TRPAK_ERR_INVALID_BANK
+ * from the middle of the dump — or, on a mapper-less cartridge, with a
+ * silently wrong image and no error at all.
+ *
+ * @param banks    Bank count taken from the header.
+ * @param max_bank Limit from mapper_max_rom_bank() or mapper_max_ram_bank().
+ * @retval TRPAK_OK                        Every bank is reachable.
+ * @retval TRPAK_ERR_UNSUPPORTED_CARTRIDGE The count exceeds the mapper.
+ */
+static int bank_count_fits_mapper(uint16_t banks, uint16_t max_bank)
+{
+    if (banks != 0u && (uint16_t)(banks - 1u) > max_bank) {
+        return TRPAK_ERR_UNSUPPORTED_CARTRIDGE;
+    }
+    return TRPAK_OK;
+}
+
+/**
  * @copydoc trpak_select_rom_bank
  *
  * Every mapper follows the same shape: point the window at slice 0 so the MBC
@@ -836,7 +1015,6 @@ bool trpak_mapper_is_supported(uint8_t mapper)
  */
 int trpak_select_rom_bank(uint16_t bank)
 {
-    uint16_t original_bank = bank;
     int result;
 
     if (trcart.rombanks != 0u && bank >= trcart.rombanks) {
@@ -847,15 +1025,24 @@ int trpak_select_rom_bank(uint16_t bank)
         return TRPAK_ERR_UNSUPPORTED_CARTRIDGE;
     }
 
+    /* One check for every mapper, before any register is touched. During
+     * trpak_init() this runs against a zeroed ::trcart, i.e. a mapper-less
+     * cartridge, which still admits the bank 0 the header read needs. */
+    if (bank > mapper_max_rom_bank(trcart.mapper)) {
+        return TRPAK_ERR_INVALID_BANK;
+    }
+
     /* Cartridges without an MBC, and bank 0 on mappers whose sequence below
      * does not special-case it, only need the window pointed at the right
-     * slice: no MBC register write is involved. */
+     * slice: no MBC register write is involved. On a mapper-less cartridge the
+     * bank number *is* the slice number, which is exactly why the limit above
+     * caps it at 1. */
     if (trcart.mapper == TRPAK_MAPPER_NONE ||
         (bank == 0u && trcart.mapper != TRPAK_MAPPER_MBC1 &&
          trcart.mapper != TRPAK_MAPPER_HUC1 && trcart.mapper != TRPAK_MAPPER_MBC5)) {
-        result = write_filled(TP_REGISTER_ADDRESS, (uint8_t)bank);
+        result = select_window_slice((uint8_t)bank);
         if (result == TRPAK_OK) {
-            trcart.bank = original_bank;
+            trcart.bank = bank;
         }
         return result;
     }
@@ -868,11 +1055,6 @@ int trpak_select_rom_bank(uint16_t bank)
         uint8_t lower = (uint8_t)(bank & 0x1Fu);        /* BANK1, GB 0x2000 */
         uint8_t upper = (uint8_t)((bank >> 5) & 0x03u); /* BANK2, GB 0x4000 */
 
-        /* Two bits of BANK2 over five of BANK1: 128 banks, 2 MiB. */
-        if (bank > 0x7Fu) {
-            return TRPAK_ERR_INVALID_BANK;
-        }
-
         if (lower == 0u) {
             /* BANK1 reads back as 1 when written as 0, so banks 0x00, 0x20,
              * 0x40 and 0x60 can never appear in the switchable region. In
@@ -884,76 +1066,55 @@ int trpak_select_rom_bank(uint16_t bank)
              * the fixed region shows in simple mode (0), which is also the
              * cartridge's resting state and what the RAM path expects to
              * find undisturbed. */
-            if ((result = write_filled(TP_REGISTER_ADDRESS, 0x01u)) != 0 ||
+            if ((result = select_window_slice(1u)) != 0 ||
                 (result = write_filled(
-                     0xE016u, bank == 0u ? 0x00u : 0x01u)) != 0 ||
-                (result = write_filled(0xC000u, upper)) != 0 ||
-                (result = write_filled(TP_REGISTER_ADDRESS, 0x00u)) != 0) {
+                     TP_REG_MBC1_MODE, bank == 0u ? 0x00u : 0x01u)) != 0 ||
+                (result = write_filled(TP_REG_RAM_BANK, upper)) != 0 ||
+                (result = select_window_slice(0u)) != 0) {
                 return result;
             }
         } else {
             /* Simple mode: BANK2:BANK1 addresses the switchable region, so
-             * the bank shows up on slice 1. Slice 1 reaches GB 0x6016 (mode)
+             * the bank shows up on slice 1. Slice 1 reaches GB 0x6000 (mode)
              * and GB 0x4000 (BANK2); slice 0 reaches GB 0x2100 (BANK1). */
-            if ((result = write_filled(TP_REGISTER_ADDRESS, 0x01u)) != 0 ||
-                (result = write_filled(0xE016u, 0x00u)) != 0 ||
-                (result = write_filled(0xC000u, upper)) != 0 ||
-                (result = write_filled(TP_REGISTER_ADDRESS, 0x00u)) != 0 ||
-                (result = write_filled(0xE100u, lower)) != 0 ||
-                (result = write_filled(TP_REGISTER_ADDRESS, 0x01u)) != 0) {
+            if ((result = select_window_slice(1u)) != 0 ||
+                (result = write_filled(TP_REG_MBC1_MODE, 0x00u)) != 0 ||
+                (result = write_filled(TP_REG_RAM_BANK, upper)) != 0 ||
+                (result = select_window_slice(0u)) != 0 ||
+                (result = write_filled(TP_REG_ROM_BANK_ALT, lower)) != 0 ||
+                (result = select_window_slice(1u)) != 0) {
                 return result;
             }
         }
         break;
     }
     case TRPAK_MAPPER_HUC1:
-        /* HuC1 uses a single six-bit ROM bank register at GB 0x2000. */
-        if (bank > 0x3Fu) {
-            return TRPAK_ERR_INVALID_BANK;
-        }
+        /* HuC1 uses a single six-bit ROM bank register at GB 0x2000. Bank 0
+         * is served by the fixed region, so it only needs the slice. */
         if (bank == 0u) {
-            result = write_filled(TP_REGISTER_ADDRESS, 0x00u);
+            result = select_window_slice(0u);
             if (result != TRPAK_OK) {
                 return result;
             }
         } else if (
-            (result = write_filled(TP_REGISTER_ADDRESS, 0x00u)) != 0 ||
-            (result = write_filled(0xE000u, (uint8_t)bank)) != 0 ||
-            (result = write_filled(TP_REGISTER_ADDRESS, 0x01u)) != 0) {
+            (result = select_window_slice(0u)) != 0 ||
+            (result = write_filled(TP_REG_ROM_BANK, (uint8_t)bank)) != 0 ||
+            (result = select_window_slice(1u)) != 0) {
             return result;
         }
         break;
     case TRPAK_MAPPER_MBC2:
-        /* MBC2 has 16 banks and only decodes the register when bit 8 of the
-         * Game Boy address is set, hence GB 0x2100 rather than 0x2000. */
-        if (bank > 0x0Fu) {
-            return TRPAK_ERR_INVALID_BANK;
-        }
-        if ((result = write_filled(TP_REGISTER_ADDRESS, 0x00u)) != 0 ||
-            (result = write_filled(0xE100u, (uint8_t)bank)) != 0 ||
-            (result = write_filled(TP_REGISTER_ADDRESS, 0x01u)) != 0) {
-            return result;
-        }
-        break;
     case TRPAK_MAPPER_MBC3:
-        /* Seven-bit bank register at GB 0x2000-0x3FFF. */
-        if (bank > 0x7Fu) {
-            return TRPAK_ERR_INVALID_BANK;
-        }
-        if ((result = write_filled(TP_REGISTER_ADDRESS, 0x00u)) != 0 ||
-            (result = write_filled(0xE100u, (uint8_t)bank)) != 0 ||
-            (result = write_filled(TP_REGISTER_ADDRESS, 0x01u)) != 0) {
-            return result;
-        }
-        break;
     case TRPAK_MAPPER_CAMERA:
-        /* The camera mapper behaves like MBC3 for plain ROM banking. */
-        if (bank > 0x3Fu) {
-            return TRPAK_ERR_INVALID_BANK;
-        }
-        if ((result = write_filled(TP_REGISTER_ADDRESS, 0x00u)) != 0 ||
-            (result = write_filled(0xE100u, (uint8_t)bank)) != 0 ||
-            (result = write_filled(TP_REGISTER_ADDRESS, 0x01u)) != 0) {
+        /* One sequence for all three: each takes the whole bank number in a
+         * single register at GB 0x2000-0x3FFF, and each is written at GB
+         * 0x2100 rather than 0x2000 because MBC2 only decodes the register
+         * when bit 8 of the Game Boy address is set. They differ solely in how
+         * wide that register is, and mapper_max_rom_bank() already enforced
+         * that above. */
+        if ((result = select_window_slice(0u)) != 0 ||
+            (result = write_filled(TP_REG_ROM_BANK_ALT, (uint8_t)bank)) != 0 ||
+            (result = select_window_slice(1u)) != 0) {
             return result;
         }
         break;
@@ -963,14 +1124,10 @@ int trpak_select_rom_bank(uint16_t bank)
 
         /* MBC5 splits nine bank bits across two registers and, unlike MBC1,
          * can select bank 0 into the switchable window. */
-        if (bank > 0x1FFu) {
-            return TRPAK_ERR_INVALID_BANK;
-        }
-
-        if ((result = write_filled(TP_REGISTER_ADDRESS, 0x00u)) != 0 ||
-            (result = write_filled(0xE000u, lower)) != 0 ||
-            (result = write_filled(0xF000u, upper)) != 0 ||
-            (result = write_filled(TP_REGISTER_ADDRESS, 0x01u)) != 0) {
+        if ((result = select_window_slice(0u)) != 0 ||
+            (result = write_filled(TP_REG_ROM_BANK, lower)) != 0 ||
+            (result = write_filled(TP_REG_ROM_BANK_HIGH, upper)) != 0 ||
+            (result = select_window_slice(1u)) != 0) {
             return result;
         }
         break;
@@ -979,7 +1136,7 @@ int trpak_select_rom_bank(uint16_t bank)
         return TRPAK_ERR_UNSUPPORTED_CARTRIDGE;
     }
 
-    trcart.bank = original_bank;
+    trcart.bank = bank;
     return TRPAK_OK;
 }
 
@@ -1009,15 +1166,17 @@ int trpak_select_ram_bank(uint16_t bank)
         return TRPAK_ERR_UNSUPPORTED_CARTRIDGE;
     }
 
-    /* MBC1 and HuC1 only have a two-bit RAM bank register. */
-    if ((trcart.mapper == TRPAK_MAPPER_MBC1 || trcart.mapper == TRPAK_MAPPER_HUC1) &&
-        bank > 0x03u) {
+    /* Every range check happens before the unlock write below. A rejected
+     * bank must not leave a battery-backed save writable, which is what the
+     * old ordering did whenever a limit narrower than the register itself
+     * — MBC3 above 7, a rumble MBC5 above 7 — was the one that fired. */
+    if (bank > mapper_max_ram_bank(trcart.mapper, trcart.rumble != 0u)) {
         return TRPAK_ERR_INVALID_BANK;
     }
 
     /* Slice 0, GB 0x0000: 0x0A is the magic value that unlocks cartridge RAM. */
-    if ((result = write_filled(TP_REGISTER_ADDRESS, 0x00u)) != 0 ||
-        (result = write_filled(0xC000u, 0x0Au)) != 0) {
+    if ((result = select_window_slice(0u)) != 0 ||
+        (result = write_filled(TP_REG_RAM_ENABLE, 0x0Au)) != 0) {
         return result;
     }
 
@@ -1025,33 +1184,20 @@ int trpak_select_ram_bank(uint16_t bank)
     if (trcart.mapper == TRPAK_MAPPER_MBC2) {
         return TRPAK_OK;
     }
-    if (trcart.mapper == TRPAK_MAPPER_MBC3 && bank > 0x07u) {
-        /* Values above 7 address the RTC registers, not RAM. */
-        return TRPAK_ERR_INVALID_BANK;
-    }
-    if (trcart.mapper == TRPAK_MAPPER_MBC5 && trcart.rumble && bank > 0x07u) {
-        /* Bit 3 controls the motor on rumble cartridges. Never set it as
-         * part of a RAM bank number. */
-        return TRPAK_ERR_INVALID_BANK;
-    }
-    if ((trcart.mapper == TRPAK_MAPPER_MBC5 || trcart.mapper == TRPAK_MAPPER_CAMERA) &&
-        bank > 0x0Fu) {
-        return TRPAK_ERR_INVALID_BANK;
-    }
 
-    /* Slice 1, so the following write lands on GB 0x4000. */
-    if ((result = write_filled(TP_REGISTER_ADDRESS, 0x01u)) != 0) {
+    /* Slice 1, so the writes below land on GB 0x6000 and GB 0x4000. */
+    if ((result = select_window_slice(1u)) != 0) {
         return result;
     }
 
     if (trcart.mapper == TRPAK_MAPPER_MBC1) {
         /* GB 0x6000: switch to banking mode 1 (RAM banking). */
-        if ((result = write_filled(0xE000u, 0x01u)) != 0) {
+        if ((result = write_filled(TP_REG_MBC1_MODE, 0x01u)) != 0) {
             return result;
         }
     }
 
-    return write_filled(0xC000u, (uint8_t)bank);
+    return write_filled(TP_REG_RAM_BANK, (uint8_t)bank);
 }
 
 /**
@@ -1074,16 +1220,16 @@ int trpak_disable_ram(void)
          * Note: a failure of the first write is reported as TRPAK_ERR_IO
          * rather than the original code, which is always TRPAK_ERR_IO here
          * anyway since write_filled() has no other failure mode. */
-        return write_filled(TP_REGISTER_ADDRESS, 0x00u) == TRPAK_OK
-            ? write_filled(0xC000u, 0x00u)
+        return select_window_slice(0u) == TRPAK_OK
+            ? write_filled(TP_REG_RAM_ENABLE, 0x00u)
             : TRPAK_ERR_IO;
     }
 
-    result = write_filled(TP_REGISTER_ADDRESS, 0x00u);
+    result = select_window_slice(0u);
     if (result != TRPAK_OK) {
         return result;
     }
-    result = write_filled(0xC000u, 0x00u);
+    result = write_filled(TP_REG_RAM_ENABLE, 0x00u);
     if (result != TRPAK_OK || trcart.mapper != TRPAK_MAPPER_MBC1) {
         return result;
     }
@@ -1093,12 +1239,16 @@ int trpak_disable_ram(void)
      * that way, the fixed GB 0x0000-0x3FFF region keeps showing bank
      * BANK2 << 5 instead of bank 0, so the next bank-0 access — a header read
      * in trpak_init(), for instance — would silently return another bank. */
-    result = write_filled(TP_REGISTER_ADDRESS, 0x01u);
+    result = select_window_slice(1u);
     if (result != TRPAK_OK) {
         return result;
     }
-    return write_filled(0xE016u, 0x00u);
+    return write_filled(TP_REG_MBC1_MODE, 0x00u);
 }
+
+/* ------------------------------------------------------------------------ */
+/* 6. Low-level 32-byte window accessors                                     */
+/* ------------------------------------------------------------------------ */
 
 /**
  * @brief Checks that a window address is in range and 32-byte aligned.
@@ -1140,7 +1290,7 @@ int trpak_read_ram_block(uint16_t address, uint8_t *data)
         return TRPAK_ERR_INVALID_ARGUMENT;
     }
 
-    result = write_filled(TP_REGISTER_ADDRESS, 0x02u);
+    result = select_window_slice(2u);
     if (result != TRPAK_OK) {
         return result;
     }
@@ -1160,12 +1310,16 @@ int trpak_write_ram_block(uint16_t address, const uint8_t *data)
         return TRPAK_ERR_INVALID_ARGUMENT;
     }
 
-    result = write_filled(TP_REGISTER_ADDRESS, 0x02u);
+    result = select_window_slice(2u);
     if (result != TRPAK_OK) {
         return result;
     }
     return transport_write(address, data);
 }
+
+/* ------------------------------------------------------------------------ */
+/* 7. Bulk operations                                                        */
+/* ------------------------------------------------------------------------ */
 
 /**
  * @brief Delivers one freshly read block to its destination.
@@ -1283,18 +1437,23 @@ static int read_rom_internal(
     uint16_t bank;
     int result = TRPAK_OK;
 
+    /* Set before the first early return: the documented contract is that
+     * `bytes_read` reflects what was copied, and a caller that only inspects
+     * it on failure must not read whatever was in the variable before. */
+    if (bytes_read != NULL) {
+        *bytes_read = 0u;
+    }
+
     if (!use_dma && (destination == NULL || capacity < trcart.romsize)) {
         return TRPAK_ERR_BUFFER_TOO_SMALL;
     }
-    if (trcart.mapper == TRPAK_MAPPER_MBC1 && trcart.rombanks > 128u) {
-        /* BANK2 is two bits wide, so MBC1 tops out at 128 banks. A header
-         * claiming more would silently wrap and duplicate banks. */
-        return TRPAK_ERR_UNSUPPORTED_CARTRIDGE;
-    }
-    if (trcart.mapper == TRPAK_MAPPER_HUC1 && trcart.rombanks > 64u) {
-        /* The HuC1 bank register is six bits wide; anything larger would
-         * silently wrap and produce a duplicated dump. */
-        return TRPAK_ERR_UNSUPPORTED_CARTRIDGE;
+    /* A header claiming more banks than the mapper's register can select
+     * would be dumped with wrapped or duplicated banks, so refuse it here
+     * rather than aborting from the middle of the traversal. */
+    result = bank_count_fits_mapper(
+        trcart.rombanks, mapper_max_rom_bank(trcart.mapper));
+    if (result != TRPAK_OK) {
+        return result;
     }
     if (ensure_io() != TRPAK_OK) {
         return TRPAK_ERR_IO;
@@ -1303,7 +1462,9 @@ static int read_rom_internal(
     for (bank = 0u; bank < trcart.rombanks; bank++) {
         uint32_t address;
 
-        result = check_cartridge_ready();
+        /* NULL: a reset before the bank is selected costs nothing, and
+         * consuming the latch here gives the inner loop a clean baseline. */
+        result = check_cartridge_ready(NULL);
         if (result != TRPAK_OK) {
             break;
         }
@@ -1317,9 +1478,22 @@ static int read_rom_internal(
         for (address = TP_ROM_WINDOW_START;
              address <= TP_WINDOW_END;
              address += TRPAK_TRANSFER_BLOCK_SIZE) {
-            result = check_cartridge_ready();
+            bool was_reset = false;
+
+            result = check_cartridge_ready(&was_reset);
             if (result != TRPAK_OK) {
                 break;
+            }
+            if (was_reset) {
+                /* The accessory reset since the previous block, so the mapper
+                 * is back at its power-on state and the bank selected above is
+                 * gone. Re-select it: without this the rest of the bank is
+                 * read from whichever bank the mapper defaults to, and the
+                 * dump records it as if nothing had happened. */
+                result = trpak_select_rom_bank(bank);
+                if (result != TRPAK_OK) {
+                    break;
+                }
             }
             result = trpak_read_rom_block((uint16_t)address, block);
             if (result != TRPAK_OK) {
@@ -1440,18 +1614,28 @@ static int read_save_internal(
     uint16_t bank;
     int result = TRPAK_OK;
 
+    if (bytes_read != NULL) {
+        *bytes_read = 0u;
+    }
+
     if (!trcart.ram || trcart.ramsize == 0u) {
         return TRPAK_ERR_NO_RAM;
     }
     if (!use_dma && (destination == NULL || capacity < trcart.ramsize)) {
         return TRPAK_ERR_BUFFER_TOO_SMALL;
     }
+    result = bank_count_fits_mapper(
+        trcart.rambanks,
+        mapper_max_ram_bank(trcart.mapper, trcart.rumble != 0u));
+    if (result != TRPAK_OK) {
+        return result;
+    }
 
     for (bank = 0u; bank < trcart.rambanks; bank++) {
         size_t bank_size = ram_bytes_for_bank(bank);
         size_t bank_offset;
 
-        result = check_cartridge_ready();
+        result = check_cartridge_ready(NULL);
         if (result != TRPAK_OK) {
             break;
         }
@@ -1463,9 +1647,20 @@ static int read_save_internal(
         for (bank_offset = 0u; bank_offset < bank_size;
              bank_offset += TRPAK_TRANSFER_BLOCK_SIZE) {
             uint16_t address = (uint16_t)(TP_RAM_WINDOW_START + bank_offset);
-            result = check_cartridge_ready();
+            bool was_reset = false;
+
+            result = check_cartridge_ready(&was_reset);
             if (result != TRPAK_OK) {
                 break;
+            }
+            if (was_reset) {
+                /* A reset re-locks cartridge RAM as well as clearing the bank
+                 * register, so the remaining blocks would read the floating
+                 * bus instead of the save. Re-selecting the bank does both. */
+                result = trpak_select_ram_bank(bank);
+                if (result != TRPAK_OK) {
+                    break;
+                }
             }
             result = trpak_read_ram_block(address, block);
             if (result != TRPAK_OK) {
@@ -1536,12 +1731,18 @@ static int write_save_internal(
     if (size != trcart.ramsize) {
         return TRPAK_ERR_INVALID_ARGUMENT;
     }
+    result = bank_count_fits_mapper(
+        trcart.rambanks,
+        mapper_max_ram_bank(trcart.mapper, trcart.rumble != 0u));
+    if (result != TRPAK_OK) {
+        return result;
+    }
 
     for (bank = 0u; bank < trcart.rambanks; bank++) {
         size_t bank_size = ram_bytes_for_bank(bank);
         size_t bank_offset;
 
-        result = check_cartridge_ready();
+        result = check_cartridge_ready(NULL);
         if (result != TRPAK_OK) {
             break;
         }
@@ -1553,9 +1754,21 @@ static int write_save_internal(
         for (bank_offset = 0u; bank_offset < bank_size;
              bank_offset += TRPAK_TRANSFER_BLOCK_SIZE) {
             uint16_t address = (uint16_t)(TP_RAM_WINDOW_START + bank_offset);
-            result = check_cartridge_ready();
+            bool was_reset = false;
+
+            result = check_cartridge_ready(&was_reset);
             if (result != TRPAK_OK) {
                 break;
+            }
+            if (was_reset) {
+                /* Same recovery as the backup path, and it matters more here:
+                 * with RAM re-locked by the reset the cartridge silently drops
+                 * every write, so a restore would report success over a save
+                 * that was never stored. */
+                result = trpak_select_ram_bank(bank);
+                if (result != TRPAK_OK) {
+                    break;
+                }
             }
             result = load_input(source, size, offset, block, use_dma);
             if (result != TRPAK_OK) {
@@ -1573,7 +1786,7 @@ static int write_save_internal(
             }
 
             if (verify_after_write) {
-                result = check_cartridge_ready();
+                result = check_cartridge_ready(NULL);
                 if (result != TRPAK_OK) {
                     break;
                 }
@@ -1638,6 +1851,10 @@ int trpak_write_save_dma(bool verify_after_write)
     );
 }
 
+/* ------------------------------------------------------------------------ */
+/* 8. Lifecycle and diagnostics                                              */
+/* ------------------------------------------------------------------------ */
+
 /**
  * @brief Powers the accessory down after a failed bring-up.
  *
@@ -1669,6 +1886,7 @@ static int fail_initialization(int result)
 int trpak_init(void)
 {
     uint8_t header[TRPAK_HEADER_SIZE];
+    uint8_t block[TRPAK_TRANSFER_BLOCK_SIZE];
     bool power;
     int result;
 
@@ -1677,7 +1895,6 @@ int trpak_init(void)
     }
 
     memset(&trcart, 0, sizeof(trcart));
-    memset(transfer_data, 0, sizeof(transfer_data));
     memset(header, 0, sizeof(header));
 
     /* Step 1: force a known-off state and verify the accessory answers. */
@@ -1725,24 +1942,24 @@ int trpak_init(void)
     }
 
     /* Step 5: read Game Boy 0x0100-0x014F in three window transactions. */
-    result = trpak_read_rom_block(0xC100u, transfer_data);
+    result = trpak_read_rom_block(0xC100u, block);
     if (result != TRPAK_OK) {
         return fail_initialization(result);
     }
-    memcpy(&header[0x00], transfer_data, TRPAK_TRANSFER_BLOCK_SIZE);
+    memcpy(&header[0x00], block, TRPAK_TRANSFER_BLOCK_SIZE);
 
-    result = trpak_read_rom_block(0xC120u, transfer_data);
+    result = trpak_read_rom_block(0xC120u, block);
     if (result != TRPAK_OK) {
         return fail_initialization(result);
     }
-    memcpy(&header[0x20], transfer_data, TRPAK_TRANSFER_BLOCK_SIZE);
+    memcpy(&header[0x20], block, TRPAK_TRANSFER_BLOCK_SIZE);
 
-    result = trpak_read_rom_block(0xC140u, transfer_data);
+    result = trpak_read_rom_block(0xC140u, block);
     if (result != TRPAK_OK) {
         return fail_initialization(result);
     }
     /* Only 16 of the 32 bytes read belong to the header. */
-    memcpy(&header[0x40], transfer_data, 16u);
+    memcpy(&header[0x40], block, 16u);
 
     /* Step 6: decode, then refuse cartridges whose mapper has no banking
      * implementation rather than letting a later dump produce garbage. */

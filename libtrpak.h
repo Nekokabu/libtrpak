@@ -77,8 +77,8 @@ extern "C" {
 #define TRPAK_MAPPER_MBC3   0x04u /**< MBC3/MBC30; RTC registers not driven. */
 #define TRPAK_MAPPER_MBC5   0x05u /**< MBC5; rumble motor is never engaged. */
 #define TRPAK_MAPPER_CAMERA 0x06u /**< Game Boy Camera; camera regs unsupported. */
-#define TRPAK_MAPPER_TAMA5  0x07u /**< Reserved identifier; not implemented. */
-#define TRPAK_MAPPER_HUC3   0x08u /**< Reserved identifier; not implemented. */
+#define TRPAK_MAPPER_TAMA5  0x07u /**< Detected only; no banking implemented. */
+#define TRPAK_MAPPER_HUC3   0x08u /**< Detected only; no banking implemented. */
 #define TRPAK_MAPPER_HUC1   0x09u /**< HuC1; dumping is limited to 64 banks. */
 #define TRPAK_MAPPER_MBC4   0x10u /**< Recognized but not implemented. */
 /** @} */
@@ -107,7 +107,9 @@ extern "C" {
  * @{
  */
 #define TRPAK_STATUS_READY        0x01u /**< Cartridge present and accessible. */
-#define TRPAK_STATUS_WAS_RESET    0x04u /**< A reset happened since last read. */
+#define TRPAK_STATUS_WAS_RESET    0x04u /**< A reset happened since last read;
+                                             read-and-clear, so each read
+                                             reports only new resets. */
 #define TRPAK_STATUS_IS_RESETTING 0x08u /**< Reset still in progress; wait. */
 #define TRPAK_STATUS_REMOVED      0x40u /**< No cartridge, or it was pulled out. */
 #define TRPAK_STATUS_POWERED      0x80u /**< Accessory power is currently on. */
@@ -146,7 +148,9 @@ typedef enum trpak_result {
  */
 typedef struct trpak_cart {
     uint8_t mapper;         /**< One of the `TRPAK_MAPPER_*` identifiers. */
-    uint8_t ram;            /**< Non-zero when the cartridge type declares RAM. */
+    uint8_t ram;            /**< Non-zero when the cartridge has usable save RAM.
+                                 Cleared when the type byte claims RAM but the
+                                 size code at `0x0149` is `0`. */
     uint8_t battery;        /**< Non-zero when the RAM is battery-backed. */
     uint8_t rtc;            /**< Non-zero for MBC3 real-time clock cartridges. */
     uint8_t rumble;         /**< Non-zero for MBC5 rumble cartridges. */
@@ -357,6 +361,11 @@ const char *trpak_error_string(int result);
  * The checksum is validated first, and `out` is zeroed before any field is
  * written. `out` may be left partially filled when a later step fails.
  *
+ * A cartridge whose type byte claims RAM while the size code at `0x0149` is
+ * `0` is decoded as RAM-less — trpak_cart::ram, ::rambanks and ::ramsize all
+ * end up zero — rather than rejected, so its ROM stays dumpable. MBC2 is
+ * unaffected: its 512 half-bytes are implied by the mapper, not by the code.
+ *
  * @param header      Buffer holding Game Boy addresses `0x0100`-`0x014F`.
  * @param header_size Size of that buffer; must be at least ::TRPAK_HEADER_SIZE.
  * @param out         Destination metadata structure.
@@ -408,14 +417,20 @@ bool trpak_mapper_is_supported(uint8_t mapper);
  * @brief Dumps the whole ROM into a buffer.
  *
  * Walks every bank in `trcart.rombanks`, re-checking cartridge presence before
- * each block, and always tries to restore ROM bank 0 afterwards. Cartridges
- * claiming more banks than their mapper can address — MBC1 above 128, HuC1
- * above 64 — are refused rather than dumped with wrapped banks.
+ * each block, and always tries to restore ROM bank 0 afterwards. If the
+ * accessory resets mid-bank the current bank is re-selected before the next
+ * block is trusted, since a reset clears the mapper's bank latch while leaving
+ * the status reporting a healthy, ready cartridge. A cartridge
+ * claiming more banks than its mapper's register can select is refused up
+ * front rather than dumped with wrapped banks: ROM-only above 2, MBC2 above
+ * 16, HuC1 and Camera above 64, MBC1 above 128, MBC3 above 128, MBC5 above
+ * 512.
  *
  * @param destination Buffer of at least `trcart.romsize` bytes; must not be NULL.
  * @param capacity    Size of `destination` in bytes.
- * @param bytes_read  Optional; receives the number of bytes actually copied,
- *                    including on partial failures.
+ * @param bytes_read  Optional; receives the number of bytes actually copied.
+ *                    Always written, including on partial failures and on the
+ *                    validation failures below, where it is set to `0`.
  * @retval TRPAK_OK                        Whole ROM copied.
  * @retval TRPAK_ERR_BUFFER_TOO_SMALL      NULL buffer or capacity below `trcart.romsize`.
  * @retval TRPAK_ERR_UNSUPPORTED_CARTRIDGE Mapper size combination that cannot be dumped safely.
@@ -428,16 +443,22 @@ int trpak_read_rom(uint8_t *destination, size_t capacity, size_t *bytes_read);
  * @brief Backs up cartridge save RAM into a buffer.
  *
  * Enables RAM, copies every RAM bank, normalizes MBC2's 4-bit cells to the low
- * nibble, and disables RAM again even when the copy fails.
+ * nibble, and disables RAM again even when the copy fails. A reset mid-bank
+ * re-locks cartridge RAM as well as clearing the bank register, so the bank is
+ * re-selected before the next block rather than read off the floating bus. As in
+ * trpak_read_rom(), a header declaring more banks than the mapper can select
+ * is refused up front instead of yielding a truncated backup.
  *
  * @param destination Buffer of at least `trcart.ramsize` bytes; must not be NULL.
  * @param capacity    Size of `destination` in bytes.
  * @param bytes_read  Optional; receives the number of bytes actually copied.
- * @retval TRPAK_OK                   Save copied.
- * @retval TRPAK_ERR_NO_RAM           Cartridge declares no save RAM.
- * @retval TRPAK_ERR_BUFFER_TOO_SMALL NULL buffer or capacity below `trcart.ramsize`.
- * @retval TRPAK_ERR_NO_CARTRIDGE     Cartridge removed mid-operation.
- * @retval TRPAK_ERR_IO               Transfer failure.
+ *                    Always written, `0` when the operation is refused.
+ * @retval TRPAK_OK                        Save copied.
+ * @retval TRPAK_ERR_NO_RAM                Cartridge declares no save RAM.
+ * @retval TRPAK_ERR_BUFFER_TOO_SMALL      NULL buffer or capacity below `trcart.ramsize`.
+ * @retval TRPAK_ERR_UNSUPPORTED_CARTRIDGE More RAM banks than the mapper can select.
+ * @retval TRPAK_ERR_NO_CARTRIDGE          Cartridge removed mid-operation.
+ * @retval TRPAK_ERR_IO                    Transfer failure.
  */
 int trpak_read_save(uint8_t *destination, size_t capacity, size_t *bytes_read);
 
@@ -445,7 +466,9 @@ int trpak_read_save(uint8_t *destination, size_t capacity, size_t *bytes_read);
  * @brief Restores a save into cartridge RAM, optionally verifying each block.
  *
  * `size` must equal `trcart.ramsize` exactly — truncated or oversized saves are
- * rejected instead of being written partially. With `verify_after_write` set,
+ * rejected instead of being written partially. A reset mid-bank re-locks
+ * cartridge RAM, which would make the cartridge drop every later write, so the
+ * bank is re-selected before the next block. With `verify_after_write` set,
  * every 32-byte block is read back and compared immediately, so the operation
  * stops at the first mismatch. RAM is disabled again on all paths.
  *
@@ -455,12 +478,13 @@ int trpak_read_save(uint8_t *destination, size_t capacity, size_t *bytes_read);
  * @param source            Save image of exactly `trcart.ramsize` bytes.
  * @param size              Must equal `trcart.ramsize`.
  * @param verify_after_write Read back and compare each written block.
- * @retval TRPAK_OK                    Save written (and verified, if requested).
- * @retval TRPAK_ERR_NO_RAM            Cartridge declares no save RAM.
- * @retval TRPAK_ERR_INVALID_ARGUMENT  NULL source, or size differs from `trcart.ramsize`.
- * @retval TRPAK_ERR_VERIFY_FAILED     A block read back differently than written.
- * @retval TRPAK_ERR_NO_CARTRIDGE      Cartridge removed mid-operation.
- * @retval TRPAK_ERR_IO                Transfer failure.
+ * @retval TRPAK_OK                        Save written (and verified, if requested).
+ * @retval TRPAK_ERR_NO_RAM                Cartridge declares no save RAM.
+ * @retval TRPAK_ERR_INVALID_ARGUMENT      NULL source, or size differs from `trcart.ramsize`.
+ * @retval TRPAK_ERR_UNSUPPORTED_CARTRIDGE More RAM banks than the mapper can select.
+ * @retval TRPAK_ERR_VERIFY_FAILED         A block read back differently than written.
+ * @retval TRPAK_ERR_NO_CARTRIDGE          Cartridge removed mid-operation.
+ * @retval TRPAK_ERR_IO                    Transfer failure.
  */
 int trpak_write_save(
     const uint8_t *source,
@@ -583,9 +607,11 @@ int trpak_get_access_state(int *state);
  * which only exist in the fixed region under advanced banking mode.
  *
  * @param bank Bank index; must be below `trcart.rombanks` and within the
- *             mapper's own limit (MBC1 `0x00`-`0x7F`, MBC2 `0x00`-`0x0F`,
- *             MBC3 `0x00`-`0x7F`, MBC5 `0x000`-`0x1FF`, HuC1 and Camera
- *             `0x00`-`0x3F`).
+ *             mapper's own limit (ROM-only `0x00`-`0x01`, MBC1 `0x00`-`0x7F`,
+ *             MBC2 `0x00`-`0x0F`, MBC3 `0x00`-`0x7F`, MBC5 `0x000`-`0x1FF`,
+ *             HuC1 and Camera `0x00`-`0x3F`). On a mapper-less cartridge the
+ *             bank number is written straight to the window's slice register,
+ *             so only the two slices that name ROM are accepted.
  * @retval TRPAK_OK                        Bank selected.
  * @retval TRPAK_ERR_INVALID_BANK          Bank out of range for the cartridge or mapper.
  * @retval TRPAK_ERR_UNSUPPORTED_CARTRIDGE Mapper has no implemented sequence.
@@ -598,10 +624,16 @@ int trpak_select_rom_bank(uint16_t bank);
  *
  * Writes the RAM-enable magic (`0x0A`) and then the bank number using the
  * mapper's register layout. MBC2 has a single implicit bank, so only the
- * enable step runs. Rumble MBC5 cartridges are capped at 8 banks because the
- * next bit of that register drives the motor.
+ * enable step runs. MBC3 is capped at 8 banks because higher values address
+ * the RTC registers, and rumble MBC5 cartridges at 8 because the next bit of
+ * that register drives the motor.
  *
- * @param bank RAM bank index, below `trcart.rambanks`.
+ * Every range check runs before the enable write, so a rejected bank never
+ * leaves cartridge RAM unlocked.
+ *
+ * @param bank RAM bank index, below `trcart.rambanks` and within the mapper's
+ *             own limit (ROM-only and MBC2 `0`, MBC1 and HuC1 `0`-`3`, MBC3
+ *             and rumble MBC5 `0`-`7`, MBC5 and Camera `0`-`15`).
  * @retval TRPAK_OK                        RAM enabled and bank selected.
  * @retval TRPAK_ERR_NO_RAM                Cartridge declares no RAM.
  * @retval TRPAK_ERR_INVALID_BANK          Bank out of range for the cartridge or mapper.
