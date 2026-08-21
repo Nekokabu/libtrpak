@@ -98,8 +98,13 @@
 /** Slice 1 -> GB 0x6000: MBC1 banking mode select. */
 #define TP_REG_MBC1_MODE       0xE000u
 
-/** Readiness poll budget; with the delay below this is a 500 ms timeout. */
+/** Readiness polls before giving up; with the delay below that is 500 ms. */
 #define TP_READY_POLL_ATTEMPTS 50u
+/** Readiness polls before giving up when no delay callback is installed.
+ * Without a delay the loop cannot pace itself in wall time and the polls run
+ * back to back, so this much larger ceiling keeps a slowly-booting cartridge
+ * or simulation from tripping the small delay-based budget. */
+#define TP_READY_POLL_ATTEMPTS_NO_DELAY 1000u
 /** Pause between readiness polls, in milliseconds. */
 #define TP_READY_POLL_DELAY_MS 10u
 
@@ -387,7 +392,12 @@ int trpak_set_power(bool enabled)
  * @copydoc trpak_get_power
  *
  * The buffer is pre-filled with `0xFF` so a backend that silently returns
- * success without writing anything cannot be mistaken for either valid state.
+ * success without writing anything is reported as unpowered rather than as a
+ * false positive. Only the exact enable value `0x84` means "on"; every other
+ * read-back — a bare `0x00`, the `0xFE` that trpak_set_power() writes to
+ * power down, or an undefined value — means "off". The accessory may echo the
+ * power-down write instead of a fixed zero, so an equality check on the off
+ * state would fail against such hardware.
  */
 int trpak_get_power(bool *enabled)
 {
@@ -404,15 +414,7 @@ int trpak_get_power(bool *enabled)
         return result;
     }
 
-    if (data[0] == 0x00u) {
-        *enabled = false;
-    } else if (data[0] == 0x84u) {
-        *enabled = true;
-    } else {
-        /* Anything else means the accessory is not answering as expected. */
-        return TRPAK_ERR_POWER_STATE;
-    }
-
+    *enabled = data[0] == 0x84u;
     return TRPAK_OK;
 }
 
@@ -535,17 +537,24 @@ static int check_cartridge_ready(bool *was_reset)
  * through. `was_reset` accumulates the read-and-clear reset latch across every
  * poll, so a reset observed while booting is still reported once ready.
  *
+ * With a delay callback installed the polls are paced 10 ms apart, so the
+ * budget is a ~500 ms wall-clock timeout. Without one the polls run back to
+ * back; that is fine for simulated cartridges, but the budget is then spent in
+ * attempts rather than in time, so a real accessory should always be given a
+ * delay callback.
+ *
  * @param was_reset Optional; receives whether any poll observed a completed
  *                  reset. Pass NULL to consume and ignore the latch.
  * @retval TRPAK_OK                   Cartridge became ready.
  * @retval TRPAK_ERR_NO_CARTRIDGE     No cartridge inserted.
  * @retval TRPAK_ERR_POWER_OFF        Accessory power is off.
  * @retval TRPAK_ERR_IO               Status read failed.
- * @retval TRPAK_ERR_TRANSFER_TIMEOUT Still not ready after ~500 ms.
+ * @retval TRPAK_ERR_TRANSFER_TIMEOUT Never became ready within the poll budget.
  */
 static int wait_for_cartridge_ready(bool *was_reset)
 {
     unsigned int attempt;
+    unsigned int attempted_polls;
     int result;
     bool reset_seen = false;
 
@@ -553,7 +562,11 @@ static int wait_for_cartridge_ready(bool *was_reset)
         *was_reset = false;
     }
 
-    for (attempt = 0u; attempt < TP_READY_POLL_ATTEMPTS; attempt++) {
+    attempted_polls = runtime.io.delay != NULL
+        ? TP_READY_POLL_ATTEMPTS
+        : TP_READY_POLL_ATTEMPTS_NO_DELAY;
+
+    for (attempt = 0u; attempt < attempted_polls; attempt++) {
         bool reset_on_this_read = false;
 
         result = check_cartridge_ready(&reset_on_this_read);
@@ -1183,7 +1196,10 @@ int trpak_select_rom_bank(uint16_t bank)
  *
  * Shape of the sequence: enable RAM through GB `0x0000` (slice 0), then write
  * the bank number to GB `0x4000` (slice 1). MBC1 additionally needs banking
- * mode 1 so that register means "RAM bank" instead of "upper ROM bits".
+ * mode 1 so that register means "RAM bank" instead of "upper ROM bits". MBC2
+ * and MBC1M multicarts stop after the enable write: both have a single fixed
+ * RAM bank, and on MBC1M the GB `0x6000` / GB `0x4000` registers would select
+ * a sub-game instead.
  */
 int trpak_select_ram_bank(uint16_t bank)
 {
@@ -1220,6 +1236,15 @@ int trpak_select_ram_bank(uint16_t bank)
 
     /* MBC2's RAM is a single internal bank: enabling it is the whole job. */
     if (trcart.mapper == TRPAK_MAPPER_MBC2) {
+        return TRPAK_OK;
+    }
+
+    /* MBC1M multicarts also have a single fixed RAM bank. Under their
+     * alternate wiring the GB 0x6000 / GB 0x4000 registers select a sub-game
+     * rather than a RAM bank, so poking them would disturb the ROM mapping
+     * already in place. Enable RAM and leave.
+     */
+    if (trcart.mapper == TRPAK_MAPPER_MBC1 && runtime.mbc1_multicart) {
         return TRPAK_OK;
     }
 
@@ -1311,6 +1336,10 @@ int trpak_read_rom_block(uint16_t address, uint8_t *data)
     if (data == NULL || !block_address_is_valid(address, TP_ROM_WINDOW_START)) {
         return TRPAK_ERR_INVALID_ARGUMENT;
     }
+
+    /* Clear first so a backend that reports success without writing cannot
+     * leave stale bytes from a previous block in the caller's buffer. */
+    memset(data, 0, TRPAK_TRANSFER_BLOCK_SIZE);
     return transport_read(address, data);
 }
 
@@ -2176,6 +2205,25 @@ int trpak_shutdown(void)
         result = current;
     }
     return result;
+}
+
+/** @copydoc trpak_version_string */
+const char *trpak_version_string(void)
+{
+    return TRPAK_VERSION;
+}
+
+/** @copydoc trpak_version */
+int trpak_version(unsigned int *major, unsigned int *minor, unsigned int *patch)
+{
+    if (major == NULL || minor == NULL || patch == NULL) {
+        return TRPAK_ERR_INVALID_ARGUMENT;
+    }
+
+    *major = TRPAK_VERSION_MAJOR;
+    *minor = TRPAK_VERSION_MINOR;
+    *patch = TRPAK_VERSION_PATCH;
+    return TRPAK_OK;
 }
 
 /** @copydoc trpak_error_string */

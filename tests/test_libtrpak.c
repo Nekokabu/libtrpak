@@ -1128,12 +1128,121 @@ static void test_api_boundaries(void)
 }
 
 /**
+ * @brief The power read-back must accept any non-enable value as "off".
+ *
+ * Real accessories may echo the power-down write (`0xFE`) instead of a fixed
+ * zero; a strict equality on the off state would make trpak_init() fail. Only
+ * the enable magic `0x84` counts as powered on. The mock allows holding
+ * arbitrary read-back bytes because mock_write() is not involved here.
+ */
+static void test_power_readback_off_value(void)
+{
+    bool enabled = true;
+
+    configure_mock();
+    mock.power = 0x84u;
+    assert(trpak_get_power(&enabled) == TRPAK_OK);
+    assert(enabled);
+
+    mock.power = 0x00u;
+    assert(trpak_get_power(&enabled) == TRPAK_OK);
+    assert(!enabled);
+
+    mock.power = 0xFEu;
+    assert(trpak_get_power(&enabled) == TRPAK_OK);
+    assert(!enabled);
+}
+
+/**
+ * @brief A cartridge that boots slowly must not time out just because the
+ *        backend has no delay callback.
+ *
+ * The readiness polls run back to back when trpak_io::delay is unset, so the
+ * budget is spent in attempts rather than in ~500 ms. The MBC1 mock is
+ * installed without a delay on purpose; booting it for 200 status reads would
+ * exhaust a 50-attempt budget and fail initialization.
+ */
+static void test_ready_poll_budget_without_delay(void)
+{
+    memset(&mbc1, 0, sizeof(mbc1));
+    create_header(mbc1.rom + 0x100u, 0x03u, 0x06u, 0x03u);
+    configure_mbc1_mock();
+    mbc1.boot_status_reads = 200u;
+    assert(trpak_init() == TRPAK_OK);
+    assert(trpak_shutdown() == TRPAK_OK);
+}
+
+/**
+ * @brief MBC1M multicarts expose a single fixed RAM bank, so bank selection
+ *        must only unlock the RAM.
+ *
+ * Under the alternate wiring the GB `0x6000` and GB `0x4000` registers select
+ * a sub-game rather than a RAM bank, so writing them during a save operation
+ * would disturb the ROM mapping. The mock's `mode` and `bank2` fields record
+ * every poke of those registers, which is what the assertions check.
+ */
+static void test_mbc1m_single_ram_bank(void)
+{
+    uint8_t save_copy[TRPAK_RAM_BANK_SIZE];
+    size_t bytes_read = 0u;
+    size_t i;
+
+    memset(&mbc1, 0, sizeof(mbc1));
+    mbc1.multicart = true;
+    for (i = 0u; i < sizeof(mbc1.ram); i++) {
+        mbc1.ram[i] = (uint8_t)(i ^ 0x33u);
+    }
+    /* MBC1 + RAM + BATTERY, 1 MiB, and a single 8 KiB RAM bank: the only
+     * shape the alternate wiring can actually reach. */
+    create_header(mbc1.rom + 0x100u, 0x03u, 0x05u, 0x02u);
+    configure_mbc1_mock();
+    assert(trpak_init() == TRPAK_OK);
+
+    /* Enabling the bank must leave the sub-game and mode registers alone. */
+    assert(trpak_select_ram_bank(0u) == TRPAK_OK);
+    assert(mbc1.ram_enabled);
+    assert(mbc1.mode == 0u);
+    assert(mbc1.bank2 == 0u);
+
+    /* And the end-to-end backup still reads the fixed bank correctly. */
+    assert(trpak_read_save(save_copy, sizeof(save_copy), &bytes_read) ==
+        TRPAK_OK);
+    assert(bytes_read == sizeof(save_copy));
+    assert(memcmp(save_copy, mbc1.ram, sizeof(save_copy)) == 0);
+    assert(!mbc1.ram_enabled);
+    assert(mbc1.mode == 0u);
+
+    assert(trpak_shutdown() == TRPAK_OK);
+}
+
+/**
+ * @brief The version accessors report the overridable macros.
+ *
+ * The string must match the numeric split exactly, and the numeric accessor
+ * must reject NULL pointers. Both values are hard-coded so a version bump
+ * forces this test to be reviewed.
+ */
+static void test_version(void)
+{
+    unsigned int major = 0u, minor = 0u, patch = 0u;
+
+    assert(strcmp(trpak_version_string(), "1.0.0") == 0);
+    assert(trpak_version(NULL, &minor, &patch) == TRPAK_ERR_INVALID_ARGUMENT);
+    assert(trpak_version(&major, NULL, &patch) == TRPAK_ERR_INVALID_ARGUMENT);
+    assert(trpak_version(&major, &minor, NULL) == TRPAK_ERR_INVALID_ARGUMENT);
+    assert(trpak_version(&major, &minor, &patch) == TRPAK_OK);
+    assert(major == 1u);
+    assert(minor == 0u);
+    assert(patch == 0u);
+}
+
+/**
  * @brief Runs the suite; any failed assertion aborts the process.
  *
- * The order matters in two places: test_api_boundaries() runs after the
- * lifecycle test, reusing the backend it configured, and the last two tests
- * overwrite ::trcart, so nothing after them may depend on the cartridge the
- * earlier tests set up.
+ * The order matters in two places: the tests between the lifecycle and the
+ * boundary-argument tests reuse the backends the earlier tests configured, and
+ * the last tests overwrite ::trcart and swap backends, so nothing after them
+ * may depend on the cartridge the earlier tests set up.
  *
  * @return `0` when every assertion held.
  */
@@ -1149,6 +1258,10 @@ int main(void)
     test_ram_stays_locked_on_rejected_bank();
     test_mapper_bank_limits();
     test_api_boundaries();
+    test_power_readback_off_value();
+    test_ready_poll_budget_without_delay();
+    test_mbc1m_single_ram_bank();
+    test_version();
     puts("libtrpak tests: OK");
     return 0;
 }

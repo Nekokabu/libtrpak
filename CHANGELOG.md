@@ -12,6 +12,34 @@ renaming `Unreleased` to that version.
 
 ### Fixed
 
+- **`trpak_get_power()` failed on hardware that echoes its power-down write.**
+  The off state was required to read back exactly `0x00`, so an accessory
+  returning the written `0xFE` (or any other byte) made `trpak_init()` fail at
+  its very first step with `TRPAK_ERR_POWER_STATE`. Only the enable magic
+  `0x84` is now treated as powered on; every other read-back counts as off.
+
+- **`trpak_read_rom_block()` left stale bytes when a backend failed to write.**
+  Unlike the RAM, power, and status paths, the ROM accessor did not clear the
+  destination before the transfer, so a backend that reported success without
+  filling the block let previous garbage flow into the dump. The block is now
+  zeroed first.
+
+- **Behind a backend without a `delay` callback, readiness polling lost its
+  budget.** The `50 × 10 ms` polls promised ~500 ms only when the loop could
+  actually sleep; without a delay the polls ran back to back and exhausted the
+  budget in microseconds, so a cartridge that booted after more than ~50
+  status reads failed with `TRPAK_ERR_TRANSFER_TIMEOUT`. The unpaced loop now
+  polls for a far larger number of attempts, and the timeout/500 ms wording
+  reflects that the wall-clock budget requires a delay callback.
+
+- **MBC1M bank selection poked the sub-game registers.** Enabling RAM wrote
+  banking mode 1 and the GB `0x4000` register, which under the alternate
+  multicart wiring select a sub-game rather than a RAM bank, disturbing the
+  ROM mapping during a save operation. MBC1M now stops after the RAM-enable
+  write, since its RAM is the single fixed bank the wiring exposes.
+
+### Changed
+
 - **Dumps of cartridges without an MBC could be silently wrong.**
   `trpak_select_rom_bank()` wrote the bank number straight into the window's
   slice register for `TRPAK_MAPPER_NONE`. Any bank above 1 therefore pointed
@@ -93,7 +121,18 @@ renaming `Unreleased` to that version.
 
 ### Added
 
-- Regression tests for every fix above: header edge cases (RAM claim with a
+- **Library version as an overridable constant.** `TRPAK_VERSION` plus
+  `TRPAK_VERSION_MAJOR`/`_MINOR`/`_PATCH` in `libtrpak.h`, defaulting to
+  `1.0.0`, with `trpak_version_string()` and `trpak_version()` reporting them
+  at runtime. Applications may redefine the macros before including the header
+  so the accessors describe their own build.
+
+- Regression tests for every fix above: the power read-back accepting any
+  non-enable byte as off, a slowly-booting cartridge surviving the no-delay
+  readiness budget, and MBC1M bank selection leaving the sub-game/mode
+  registers untouched while still backing up the fixed RAM bank.
+
+- Regression tests for every fix below: header edge cases (RAM claim with a
   zero size code, MBC2's implicit RAM, TAMA5 and HuC3), recovery from a reset
   during a dump, a backup, and a restore (including the pre-flight race), a
   byte-exact MBC1M dump, modern CGB title decoding, refusal of over-large bank

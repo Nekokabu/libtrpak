@@ -62,6 +62,31 @@ extern "C" {
 #endif
 
 /**
+ * @name Library version
+ *
+ * The build version of the library, reported by trpak_version_string() and
+ * trpak_version(). All four macros are overridable: define them before
+ * including this header — with `-D` on the compiler command line or with a
+ * bare `#define` — to change what the accessors return, which is how an
+ * application makes the library report the application's version rather than
+ * its own.
+ * @{
+ */
+#ifndef TRPAK_VERSION
+#define TRPAK_VERSION       "1.0.0"
+#endif
+#ifndef TRPAK_VERSION_MAJOR
+#define TRPAK_VERSION_MAJOR 1
+#endif
+#ifndef TRPAK_VERSION_MINOR
+#define TRPAK_VERSION_MINOR 0
+#endif
+#ifndef TRPAK_VERSION_PATCH
+#define TRPAK_VERSION_PATCH 0
+#endif
+/** @} */
+
+/**
  * @name Mapper identifiers
  *
  * Values stored in trpak_cart::mapper. They are libtrpak's own identifiers,
@@ -207,8 +232,9 @@ typedef int (*trpak_write_block_fn)(
  * @brief Busy-waits for the requested number of milliseconds.
  *
  * Used after power changes and while polling for readiness. When absent, the
- * library skips the waits, which is safe for simulated backends but not
- * recommended on real hardware.
+ * library skips the waits; without it the readiness polls run back to back, so
+ * their timeout budget is spent in attempts rather than wall time. That is safe
+ * for simulated backends but not recommended on real hardware.
  *
  * @param user         Opaque pointer taken from trpak_io::user.
  * @param milliseconds Delay length; always greater than zero.
@@ -277,6 +303,28 @@ typedef struct trpak_io {
 extern trpak_cart trcart;
 
 /* ------------------------------------------------------------------------ */
+/* Version                                                                   */
+/* ------------------------------------------------------------------------ */
+
+/**
+ * @brief Returns the library version as a single static string.
+ *
+ * @return ::TRPAK_VERSION; never NULL.
+ */
+const char *trpak_version_string(void);
+
+/**
+ * @brief Returns the major, minor, and patch components separately.
+ *
+ * @param major Receives ::TRPAK_VERSION_MAJOR.
+ * @param minor Receives ::TRPAK_VERSION_MINOR.
+ * @param patch Receives ::TRPAK_VERSION_PATCH.
+ * @retval TRPAK_OK                   Components written.
+ * @retval TRPAK_ERR_INVALID_ARGUMENT Any output pointer is NULL.
+ */
+int trpak_version(unsigned int *major, unsigned int *minor, unsigned int *patch);
+
+/* ------------------------------------------------------------------------ */
 /* Configuration and lifecycle                                              */
 /* ------------------------------------------------------------------------ */
 
@@ -313,10 +361,11 @@ void trpak_use_default_io(void);
  *
  * Performs the full bring-up sequence: power off, confirm off, power on,
  * confirm on, enable access mode, poll until the cartridge reports ready
- * (up to 500 ms), select ROM bank 0, read Game Boy addresses `0x0100`-`0x014F`
- * in three blocks, validate the header checksum, and reject mappers with no
- * implemented banking path. On failure it powers the accessory back down
- * before returning, and ::trcart is left zeroed or partially filled.
+ * (up to ~500 ms with a delay callback installed), select ROM bank 0, read
+ * Game Boy addresses `0x0100`-`0x014F` in three blocks, validate the header
+ * checksum, and reject mappers with no implemented banking path. On failure it
+ * powers the accessory back down before returning, and ::trcart is left zeroed
+ * or partially filled.
  *
  * @retval TRPAK_OK                     Cartridge detected and described in ::trcart.
  * @retval TRPAK_ERR_IO                 No usable backend, or a transfer failed.
@@ -553,10 +602,13 @@ int trpak_set_power(bool enabled);
 /**
  * @brief Reads back the accessory power state.
  *
+ * Only the enable magic (`0x84`) is treated as powered on; any other byte —
+ * the value written to power down, `0x00`, or an undefined read-back — is
+ * reported as off, so hardware that echoes its power-down write still works.
+ *
  * @param enabled Receives `true` when powered, `false` when off.
  * @retval TRPAK_OK                   State read.
  * @retval TRPAK_ERR_INVALID_ARGUMENT `enabled` is NULL.
- * @retval TRPAK_ERR_POWER_STATE      Register held neither the on nor the off value.
  * @retval TRPAK_ERR_IO               Transfer failure.
  */
 int trpak_get_power(bool *enabled);
@@ -630,16 +682,17 @@ int trpak_select_rom_bank(uint16_t bank);
  *
  * Writes the RAM-enable magic (`0x0A`) and then the bank number using the
  * mapper's register layout. MBC2 has a single implicit bank, so only the
- * enable step runs. MBC3 is capped at 8 banks because higher values address
- * the RTC registers, and rumble MBC5 cartridges at 8 because the next bit of
- * that register drives the motor.
+ * enable step runs, as does MBC1M — whose GB `0x6000`/`0x4000` registers
+ * select a sub-game rather than a RAM bank. MBC3 is capped at 8 banks because
+ * higher values address the RTC registers, and rumble MBC5 cartridges at 8
+ * because the next bit of that register drives the motor.
  *
  * Every range check runs before the enable write, so a rejected bank never
  * leaves cartridge RAM unlocked.
  *
  * @param bank RAM bank index, below `trcart.rambanks` and within the mapper's
- *             own limit (ROM-only and MBC2 `0`, MBC1 and HuC1 `0`-`3`, MBC3
- *             and rumble MBC5 `0`-`7`, MBC5 and Camera `0`-`15`).
+ *             own limit (ROM-only, MBC2 and MBC1M `0`, MBC1 and HuC1 `0`-`3`,
+ *             MBC3 and rumble MBC5 `0`-`7`, MBC5 and Camera `0`-`15`).
  * @retval TRPAK_OK                        RAM enabled and bank selected.
  * @retval TRPAK_ERR_NO_RAM                Cartridge declares no RAM.
  * @retval TRPAK_ERR_INVALID_BANK          Bank out of range for the cartridge or mapper.
@@ -652,9 +705,10 @@ int trpak_select_ram_bank(uint16_t bank);
  * @brief Disables and write-protects cartridge RAM again.
  *
  * A no-op for cartridges without RAM or without an MBC. HuC1 cannot truly
- * disable RAM, so it is only kept in RAM mode rather than infrared mode. On
- * MBC1 this also restores simple banking mode, which trpak_select_ram_bank()
- * had to leave in advanced mode.
+ * disable RAM, so it is only kept in RAM mode rather than infrared mode. On a
+ * conventional MBC1 this also restores simple banking mode, which
+ * trpak_select_ram_bank() had to leave in advanced mode; MBC1M never changes
+ * it.
  *
  * @return ::TRPAK_OK or ::TRPAK_ERR_IO.
  */

@@ -194,7 +194,7 @@ disable RAM even if an intermediate failure occurs.
 5. Perform the required dump, backup, or restoration.
 6. Call `trpak_shutdown()`, including after application errors.
 
-If initialization fails after the Transfer Pak is powered on, the library itself attempts cleanup, disables access mode, and powers off the accessory. Initialization interprets status as a bitfield and waits up to 500 ms for reset completion and readiness.
+If initialization fails after the Transfer Pak is powered on, the library itself attempts cleanup, disables access mode, and powers off the accessory. Initialization interprets status as a bitfield and waits for reset completion and readiness; the poll budget is ~500 ms when a delay callback is installed, and attempt-based (unpaced) otherwise.
 
 ## Cartridge information
 
