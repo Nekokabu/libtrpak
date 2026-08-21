@@ -3,12 +3,16 @@
 All notable changes to `libtrpak` are documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
-The project carries no version number and no git tags yet, so the sections
-below are anchored to the initial import rather than to releases. Adopting
-[Semantic Versioning](https://semver.org/) means tagging a first release and
-renaming `Unreleased` to that version.
+The version is the one published by the `TRPAK_VERSION` macros and the
+`trpak_version()` accessors in [libtrpak.h](libtrpak.h).
 
 ## [Unreleased]
+
+## [1.0.0] - 2026-08-20
+
+First release. It bands together the fixes from the initial import: the
+bring-up and transfer logic, the power and readiness contracts, and the
+overridable version constant.
 
 ### Fixed
 
@@ -37,8 +41,6 @@ renaming `Unreleased` to that version.
   multicart wiring select a sub-game rather than a RAM bank, disturbing the
   ROM mapping during a save operation. MBC1M now stops after the RAM-enable
   write, since its RAM is the single fixed bank the wiring exposes.
-
-### Changed
 
 - **Dumps of cartridges without an MBC could be silently wrong.**
   `trpak_select_rom_bank()` wrote the bank number straight into the window's

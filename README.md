@@ -36,6 +36,8 @@ The project uses [libdragon](https://github.com/DragonMinded/libdragon) to contr
   battery-backed save writable.
 - Injectable transport backend for tests and alternative platforms.
 - Native `trpak`-namespace API.
+- Overridable `TRPAK_VERSION` constant, defaulting to `1.0.0`, exposed through
+  `trpak_version_string()` and `trpak_version()`.
 - Host tests with Transfer Pak mocks.
 
 ## Repository layout
@@ -222,6 +224,21 @@ The global `trcart` variable, declared in the header, receives the parsed metada
 
 ## Modern API
 
+### Version
+
+The build version is published through four overridable macros —
+`TRPAK_VERSION`, `TRPAK_VERSION_MAJOR`, `TRPAK_VERSION_MINOR`, and
+`TRPAK_VERSION_PATCH` — and defaults to `1.0.0`:
+
+| Function | Purpose |
+| --- | --- |
+| `trpak_version_string()` | Returns the version string (`1.0.0` by default). |
+| `trpak_version(&major, &minor, &patch)` | Returns the numeric components. |
+
+An application that redefines the macros before including `libtrpak.h` — for
+example with `-DTRPAK_VERSION="app 2.0.0"` — makes both accessors report the
+application's version instead of the library's.
+
 ### Configuration and lifecycle
 
 | Function | Purpose |
@@ -269,12 +286,12 @@ before trusting the result.
 | Function | Purpose |
 | --- | --- |
 | `trpak_set_power(enabled)` | Powers the Transfer Pak on or off. |
-| `trpak_get_power(&enabled)` | Queries power with validation of the returned value. |
+| `trpak_get_power(&enabled)` | Queries power; only the enable magic `0x84` counts as on, any other read-back as off. |
 | `trpak_set_access_state(enabled)` | Enables or disables access mode. |
 | `trpak_get_status(&status)` | Gets the raw Transfer Pak status bitfield. |
 | `trpak_get_access_state(&state)` | Interprets combinations of readiness, reset, and removal bits. |
 | `trpak_select_rom_bank(bank)` | Validates and selects a ROM bank. |
-| `trpak_select_ram_bank(bank)` | Validates the bank, then enables RAM and selects it. The order matters: a rejected bank leaves RAM locked. |
+| `trpak_select_ram_bank(bank)` | Validates the bank, then enables RAM and selects it. The order matters: a rejected bank leaves RAM locked. MBC2 and MBC1M only unlock their single fixed bank. |
 | `trpak_disable_ram()` | Disables and protects RAM again when the mapper permits it. HuC1 remains in RAM mode because it cannot disable RAM. |
 
 ### Low-level access
@@ -320,7 +337,7 @@ regions:
 
 | Transfer Pak address | Purpose |
 | --- | --- |
-| `0x8000` | Power control: write `0x84` to switch the cartridge on, read the state back. |
+| `0x8000` | Power control: write `0x84` to switch the cartridge on; the read-back reports `0x84` on and anything else off. |
 | `0xA000` | Bank register: which 16 KiB slice of the Game Boy address space the window shows. |
 | `0xB000` | Status bitfield on read, access-mode control on write. |
 | `0xC000–0xFFFF` | 16 KiB data window onto the selected slice. |
@@ -462,7 +479,12 @@ The tests compile `libtrpak.c` with `TRPAK_NO_DEFAULT_IO`, install a simulated b
   implicit RAM, and the detected-but-unsupported TAMA5 and HuC3 types;
 - refusal of every mapper's over-large bank count before any data moves, with
   `bytes_read` left at zero;
-- that a rejected RAM bank leaves cartridge RAM locked.
+- that a rejected RAM bank leaves cartridge RAM locked;
+- treating the power-down read-back (`0xFE`) as off;
+- a slow boot surviving the readiness budget behind a backend with no delay
+  callback, whose polls run back to back;
+- backing up an MBC1M save without touching the sub-game and mode registers;
+- the version accessors reporting the `1.0.0` macros.
 
 The target also compiles the default backend against stubs containing the current Joybus, delay, cache, and DMA signatures, preventing name or type regressions in that layer.
 
