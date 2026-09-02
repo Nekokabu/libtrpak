@@ -896,13 +896,16 @@ static uint16_t mapper_max_rom_bank(uint8_t mapper) {
     case TRPAK_MAPPER_NONE:   return 0x001u; /* Window slices 0 and 1 */
     case TRPAK_MAPPER_MBC1:   return runtime.mbc1_multicart ? 0x03Fu : 0x07Fu;
     case TRPAK_MAPPER_MBC2:   return 0x00Fu; /* Four bits */
-    case TRPAK_MAPPER_MBC3:   return 0x07Fu; /* Seven bits */
+    
+    /* BUGFIX: MBC30 uses MBC3 mapper but supports 4 MiB (256 banks). Extended limit from 0x7F to 0xFF. */
+    case TRPAK_MAPPER_MBC3:   return 0x0FFu; /* Eight bits to support MBC30 (4 MiB) */
+    
     case TRPAK_MAPPER_MBC5:   return 0x1FFu; /* Nine bits over two regs */
     case TRPAK_MAPPER_CAMERA: return 0x03Fu; /* Six bits */
     case TRPAK_MAPPER_HUC1:   return 0x03Fu; /* Six bits */
     case TRPAK_MAPPER_TAMA5:  return 0x0FFu; /* Eight bits (similar to MBC5 low byte) */
     case TRPAK_MAPPER_HUC3:   return 0x1FFu; /* Nine bits over two regs */
-    case TRPAK_MAPPER_MBC6:   return 0x00Fu; /* Single bank only */
+    case TRPAK_MAPPER_MBC6:   return 0x07Fu; /* 128 banks (2MB) support */
     case TRPAK_MAPPER_MBC7:   return 0x1FFu; /* Nine bits like MBC5 */
     case TRPAK_MAPPER_MMM01:  return 0x0FFu; 
     default:                  return 0u;
@@ -928,13 +931,16 @@ static uint16_t mapper_max_ram_bank(uint8_t mapper, bool rumble) {
     case TRPAK_MAPPER_NONE:   return 0x0u; /* Unbanked */
     case TRPAK_MAPPER_MBC1:   return runtime.mbc1_multicart ? 0x0u : 0x3u;
     case TRPAK_MAPPER_MBC2:   return 0x0u; /* One internal bank */
-    case TRPAK_MAPPER_MBC3:   return 0x7u; /* Above 7 selects the RTC */
+    
+    /* BUGFIX: Allowing up to bank 0x0C so users can manually read the MBC3 RTC registers (0x08-0x0C). */
+    case TRPAK_MAPPER_MBC3:   return 0x0Cu; /* Above 7 selects the RTC registers (08-0C) */
+    
     case TRPAK_MAPPER_MBC5:   return rumble ? 0x7u : 0xFu;
     case TRPAK_MAPPER_CAMERA: return 0xFu; /* Four bits */
     case TRPAK_MAPPER_HUC1:   return 0x3u; /* Two bits */
     case TRPAK_MAPPER_TAMA5:  return 0xFFu; /* Eight bits like MBC5 low byte */
     case TRPAK_MAPPER_HUC3:   return rumble ? 0x7u : 0xFu;
-    case TRPAK_MAPPER_MBC6:   return 0x0Fu; /* Single bank only */
+    case TRPAK_MAPPER_MBC6:   return 0x03u; /* 32 KiB (4 banks of 8 KiB) */
     case TRPAK_MAPPER_MBC7:   return 0x7u; /* RTC limit at bank > 7 */
     case TRPAK_MAPPER_MMM01:  return 0x3u; /* Two bits like HUC1 */
     default:                  return 0u;
@@ -1001,7 +1007,8 @@ int trpak_select_rom_bank(uint16_t bank) {
      * caps it at 1. */
     if (trcart.mapper == TRPAK_MAPPER_NONE ||
         (bank == 0u && trcart.mapper != TRPAK_MAPPER_MBC1 &&
-         trcart.mapper != TRPAK_MAPPER_HUC1 && trcart.mapper != TRPAK_MAPPER_MBC5)) {
+         trcart.mapper != TRPAK_MAPPER_HUC1 && trcart.mapper != TRPAK_MAPPER_MBC5 &&
+         trcart.mapper != TRPAK_MAPPER_HUC3 && trcart.mapper != TRPAK_MAPPER_MBC7)) {
         result = select_window_slice((uint8_t)bank);
         if (result == TRPAK_OK) {
             trcart.bank = bank;
@@ -1112,6 +1119,10 @@ int trpak_select_rom_bank(uint16_t bank) {
         break;
     }
 
+    /* BUGFIX: HuC3 and MBC7 are MBC5-compatible for ROM banking. They must fall through to MBC5 logic 
+     * instead of writing the 9th bit to GB 0x4000 (which would conflict with RAM/EEPROM context). */
+    case TRPAK_MAPPER_HUC3:
+    case TRPAK_MAPPER_MBC7:
     case TRPAK_MAPPER_MBC5: {
         uint8_t lower = (uint8_t)(bank & 0xFFu);        /* GB 0x2000 */
         uint8_t upper = (uint8_t)((bank >> 8) & 0x01u); /* GB 0x3000 */
@@ -1157,29 +1168,26 @@ int trpak_select_rom_bank(uint16_t bank) {
         }
         break;
     }
-    	
-    case TRPAK_MAPPER_HUC3:
-    case TRPAK_MAPPER_MBC7: {
-        /* HuC3 / MBC7: MBC5-compatible.
-         *   Lower 8 bits → GB 0x2000 (slice 0, TP 0xE000)
-         *   Bit 8        → GB 0x4000 (slice 1, TP 0xC000) */
-        uint8_t lower = (uint8_t)(bank & 0xFFu);
-        uint8_t upper = (uint8_t)((bank >> 8) & 0x01u);
+
+    case TRPAK_MAPPER_MBC6: {
+        /*
+         * The MBC6 switches banks in 8 KiB increments.
+         * Since data is dumped in 16 KiB units, `bank * 2` is mapped to Bank A (GB 0x4000–0x5FFF),
+         * and `bank * 2 + 1` is mapped to Bank B (GB 0x6000–0x7FFF).
+         */
+        uint8_t bank_a = (uint8_t)((bank * 2) & 0xFFu);
+        uint8_t bank_b = (uint8_t)(((bank * 2) + 1) & 0xFFu);
 
         if ((result = select_window_slice(0u)) != 0 ||
-            (result = write_filled(TP_REG_ROM_BANK, lower)) != 0 ||
-            (result = select_window_slice(1u)) != 0 ||
-            (result = write_filled(0xC000u, upper)) != 0) {   /* GB 0x4000 on slice 1 */
+            (result = write_filled(0xE000u, bank_a)) != 0 || // GB 0x2000: ROM/Flash Bank A Number
+            (result = write_filled(0xE800u, 0x00u)) != 0 ||  // GB 0x2800: ROM/Flash Bank A Select (0x00 = ROM)
+            (result = write_filled(0xF000u, bank_b)) != 0 || // GB 0x3000: ROM/Flash Bank B Number
+            (result = write_filled(0xF800u, 0x00u)) != 0 ||  // GB 0x3800: ROM/Flash Bank B Select (0x00 = ROM)
+            (result = select_window_slice(1u)) != 0) {
             return result;
         }
         break;
     }
-    case TRPAK_MAPPER_MBC6:
-        /* MBC6 uses a single ROM bank register. Bank 0 is default. */
-        if (bank != 0u) {
-            return TRPAK_ERR_INVALID_BANK;
-        }
-        break;
     default:
         return TRPAK_ERR_UNSUPPORTED_CARTRIDGE;
     }
@@ -1236,6 +1244,15 @@ int trpak_select_ram_bank(uint16_t bank) {
         return result;
     }
 
+    /* BUGFIX: MBC6 has its SRAM split into two 4 KiB halves (Bank A and Bank B).
+     * Both halves must be enabled simultaneously. Bank B's enable register is at GB 0x0200. */
+    if (trcart.mapper == TRPAK_MAPPER_MBC6) {
+        result = write_filled(0xC200u, 0x0Au); // GB 0x0200 on Slice 0
+        if (result != TRPAK_OK) {
+            return result;
+        }
+    }
+
     /* MBC2's RAM is a single internal bank. */
     if (trcart.mapper == TRPAK_MAPPER_MBC2) {
         return TRPAK_OK;
@@ -1266,8 +1283,10 @@ int trpak_select_ram_bank(uint16_t bank) {
         break;
 
     case TRPAK_MAPPER_HUC1:
-        /* HUC1 RAM bank register is at GB 0x4000 */
-        result = write_filled(TP_REG_ROM_BANK_HIGH, (uint8_t)bank);
+        /* BUGFIX: HUC1 RAM bank register is at GB 0x4000.
+         * On slice 1, this corresponds to TP_REG_RAM_BANK (0xC000), 
+         * NOT TP_REG_ROM_BANK_HIGH (0xF000 which would write to GB 0x7000). */
+        result = write_filled(TP_REG_RAM_BANK, (uint8_t)bank);
         if (result != TRPAK_OK) {
             return result;
         }
@@ -1300,6 +1319,21 @@ int trpak_select_ram_bank(uint16_t bank) {
             return TRPAK_ERR_INVALID_BANK;
         }
         break;
+
+    case TRPAK_MAPPER_MBC6: {
+        /* MBC6 SRAM is organized in 4 KiB units. Concatenate Bank A (0xA000) and Bank B (0xB000). */
+        uint8_t ram_bank_a = (uint8_t)((bank * 2) & 0x07u);
+        uint8_t ram_bank_b = (uint8_t)(((bank * 2) + 1) & 0x07u);
+
+        /* The MBC6 RAM bank selection registers are at GB 0x0400 and 0x0800 (Slice 0) */
+        if ((result = select_window_slice(0u)) != 0 ||
+            (result = write_filled(0xC400u, ram_bank_a)) != 0 || // GB 0x0400
+            (result = write_filled(0xC800u, ram_bank_b)) != 0 || // GB 0x0800
+            (result = select_window_slice(2u)) != 0) {           // Return to Read Mode (Slice 2)
+            return result;
+        }
+        break;
+    }
 
     default:
         /* MBC3, Camera use standard RAM banking logic */
@@ -1359,6 +1393,13 @@ int trpak_disable_ram(void) {
         }
         break;
     }
+
+    case TRPAK_MAPPER_MBC6:
+        /* BUGFIX: Must disable both RAM Bank A (GB 0x0000) and RAM Bank B (GB 0x0200) simultaneously. */
+        return (select_window_slice(0u) == TRPAK_OK &&
+                write_filled(0xC000u, 0x00u) == TRPAK_OK &&
+                write_filled(0xC200u, 0x00u) == TRPAK_OK)
+            ? TRPAK_OK : TRPAK_ERR_IO;
 
     case TRPAK_MAPPER_HUC3:
     case TRPAK_MAPPER_TAMA5:
@@ -1578,6 +1619,13 @@ static int load_input(
  * @param use_dma     Select the DMA output path.
  * @return ::TRPAK_OK or the first error encountered.
  */
+/**
+ * @brief Shared ROM dump loop behind trpak_read_rom() and trpak_read_rom_dma().
+ *
+ * Optimized version: status is checked per bank to reduce overhead, but 
+ * block-level reset detection (`was_reset`) is preserved so that any transient 
+ * contact glitch or reset triggers an automatic retry for that block.
+ */
 static int read_rom_internal(
     uint8_t *destination,
     size_t capacity,
@@ -1613,8 +1661,8 @@ static int read_rom_internal(
         return TRPAK_ERR_IO;
     }
 
-	// TAMA5 initialize
-	if (trcart.mapper == TRPAK_MAPPER_TAMA5) {
+    // TAMA5 initialize
+    if (trcart.mapper == TRPAK_MAPPER_TAMA5) {
         uint8_t unlock_payload[TRPAK_TRANSFER_BLOCK_SIZE];
         
         // Write 0x0A to the odd address (A001) to unlock.
@@ -1645,8 +1693,8 @@ static int read_rom_internal(
             }
         }
     }
-	// MMM01 initialize
-	else if (trcart.mapper == TRPAK_MAPPER_MMM01) {
+    // MMM01 initialize
+    else if (trcart.mapper == TRPAK_MAPPER_MMM01) {
         if ((result = select_window_slice(1u)) != 0 ||
             (result = write_filled(TP_REG_MBC1_MODE, 0x40u)) != 0 || // GB 0x6000: Multiplex=1, ROM Bank Mask=0, Mode=0
             (result = write_filled(TP_REG_RAM_BANK, 0x00u)) != 0 ||  // GB 0x4000: Base ROM High=0
@@ -1656,18 +1704,11 @@ static int read_rom_internal(
             return result;
         }
     }
-	//			TP address
-	//Slice		0xC000, 0xD000, 0xE000, 0xF000
-	//	0		0x0		0x1		0x2		0x3
-	//	1		0x4		0x5		0x6		0x7
-	//	2		0x8		0x9		0xa		0xb
-	//	3		0xc		0xd		0xe		0xf
-	
+    
     for (bank = 0u; bank < trcart.rombanks; bank++) {
         uint32_t address;
 
-        /* NULL: a reset before the bank is selected costs nothing, and
-         * consuming the latch here gives the inner loop a clean baseline. */
+        /* Check cartridge readiness and consume the reset latch once per bank. */
         result = wait_for_cartridge_ready(NULL);
         if (result != TRPAK_OK) {
             break;
@@ -1687,39 +1728,28 @@ static int read_rom_internal(
             for (;;) {
                 bool was_reset = false;
 
-                result = wait_for_cartridge_ready(&was_reset);
-                if (result != TRPAK_OK) {
-                    break;
-                }
-                if (was_reset) {
-                    result = trpak_select_rom_bank(bank);
-                    if (result != TRPAK_OK) {
-                        break;
-                    }
-                }
                 result = trpak_read_rom_block((uint16_t)address, block);
                 if (result != TRPAK_OK) {
                     break;
                 }
 
-                /* A reset can happen after the pre-flight status read but
-                 * before the data transaction. Check again before trusting the
-                 * block and repeat the same address if its bank latch changed. */
-                was_reset = false;
+                /* Check if a reset occurred during or immediately after the block read. */
                 result = wait_for_cartridge_ready(&was_reset);
                 if (result != TRPAK_OK) {
                     break;
                 }
+
                 if (was_reset) {
                     if (++retry >= TP_READY_POLL_ATTEMPTS) {
                         result = TRPAK_ERR_TRANSFER_TIMEOUT;
                         break;
                     }
+                    /* Re-apply the bank selection since the hardware reset wiped the mapper state. */
                     result = trpak_select_rom_bank(bank);
                     if (result != TRPAK_OK) {
                         break;
                     }
-                    continue;
+                    continue; // Retry reading the current block
                 }
 
                 result = store_output(destination, capacity, offset, block, use_dma);
@@ -1824,6 +1854,32 @@ static int read_save_internal(
         *bytes_read = 0u;
     }
 
+	if (trcart.mapper == TRPAK_MAPPER_TAMA5) {
+        if (!use_dma && (destination == NULL || capacity < 32u)) return TRPAK_ERR_BUFFER_TOO_SMALL;
+        if ((result = select_window_slice(2u)) != 0) return result; // GB 0xA000 -> TP 0xE000
+
+        uint8_t payload[TRPAK_TRANSFER_BLOCK_SIZE];
+        uint8_t read_block[TRPAK_TRANSFER_BLOCK_SIZE];
+        
+        for (uint8_t i = 0; i < 32; i++) {
+            memset(payload, 0x0A, sizeof(payload)); // Fill with harmless registers.
+            payload[1] = i; // 0xA001: Specify the address to read from.
+            
+            if ((result = transport_write(0xE000u, payload)) != 0) return result;
+            if ((result = transport_read(0xE000u, read_block)) != 0) return result;
+            
+            if (destination != NULL) destination[i] = read_block[0]; // Data at 0xA000
+        }
+        if (bytes_read != NULL) *bytes_read = 32u;
+        return TRPAK_OK;
+    }
+	
+	if (trcart.mapper == TRPAK_MAPPER_MBC7) {
+        /* MBC7 uses Microwire Serial EEPROM via bit-banging at 0xA000.
+         * Standard block-based SRAM reading/writing is incompatible. */
+        return TRPAK_ERR_UNSUPPORTED_CARTRIDGE;
+    }
+	
     if (!trcart.ram || trcart.ramsize == 0u) {
         return TRPAK_ERR_NO_RAM;
     }
@@ -1953,6 +2009,32 @@ static int write_save_internal(
     uint16_t bank;
     int result = TRPAK_OK;
 
+	if (trcart.mapper == TRPAK_MAPPER_TAMA5) {
+        if (!use_dma && (source == NULL || size != 32u)) return TRPAK_ERR_INVALID_ARGUMENT;
+        if ((result = select_window_slice(2u)) != 0) return result;
+
+        uint8_t payload[TRPAK_TRANSFER_BLOCK_SIZE];
+        
+        for (uint8_t i = 0; i < 32; i++) {
+            memset(payload, 0x0A, sizeof(payload));
+            /* Leveraging the Transfer Pak's behavior of transmitting bytes 
+        	   sequentially starting from the lowest address,
+               complete both address specification (A001) and 
+        	   data writing (A002 = A000 mirror) in a single block transfer. */
+            payload[1] = i;         // 0xA001: Specify the address to write to.
+            payload[2] = source[i]; // 0xA002 (Effective address 0xA000): Write data
+            
+            if ((result = transport_write(0xE000u, payload)) != 0) return result;
+        }
+        return TRPAK_OK;
+    }
+
+	if (trcart.mapper == TRPAK_MAPPER_MBC7) {
+        /* MBC7 uses Microwire Serial EEPROM via bit-banging at 0xA000.
+         * Standard block-based SRAM reading/writing is incompatible. */
+        return TRPAK_ERR_UNSUPPORTED_CARTRIDGE;
+    }
+	
     if (!trcart.ram || trcart.ramsize == 0u) {
         return TRPAK_ERR_NO_RAM;
     }
@@ -2277,9 +2359,9 @@ int trpak_init(void) {
     if (result != TRPAK_OK) {
         return fail_initialization(result);
     }
-    //if (!trpak_mapper_is_supported(trcart.mapper)) {
-    //    return fail_initialization(TRPAK_ERR_UNSUPPORTED_CARTRIDGE);
-    //}
+    if (!trpak_mapper_is_supported(trcart.mapper)) {
+        return fail_initialization(TRPAK_ERR_UNSUPPORTED_CARTRIDGE);
+    }
 
     /* Step 7: 1 MiB MBC1 multicarts use different register wiring that is not
      * represented in the header. Probe bank 0x10 before any bulk traversal. */
